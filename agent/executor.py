@@ -453,9 +453,17 @@ def _register_payment(intent: dict, client: TripletexClient) -> None:
     ident = inv_data.get("identifier")
     if ident and str(ident).isdigit():
         try:
+            # Tripletex requires date range even when filtering by invoiceNumber
+            date_from = (date.today() - timedelta(days=365 * 5)).isoformat()
+            date_to = (date.today() + timedelta(days=365)).isoformat()
             results = client.get_list(
                 "/invoice",
-                params={"invoiceNumber": ident, "count": 5},
+                params={
+                    "invoiceNumber": ident,
+                    "invoiceDateFrom": date_from,
+                    "invoiceDateTo": date_to,
+                    "count": 5,
+                },
             )
             if results:
                 invoice = results[0]
