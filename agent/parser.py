@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import os
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +45,7 @@ def _get_client() -> genai.Client:
 # System prompt – covers all task types in 7 languages
 # ------------------------------------------------------------------ #
 
-_SYSTEM_PROMPT = """You are an expert accounting task analyzer for Tripletex (Norwegian ERP).
+_SYSTEM_PROMPT_TEMPLATE = """You are an expert accounting task analyzer for Tripletex (Norwegian ERP).
 
 Parse prompts in ANY of these 7 languages: Norwegian Bokmål (nb), English (en), Spanish (es), Portuguese (pt), Norwegian Nynorsk (nn), German (de), French (fr).
 
@@ -150,7 +151,7 @@ NOT SUPPORTED — use task_type "unknown" for:
 DATES
 ══════════════════════════════════════════════
 Always output dates as YYYY-MM-DD.
-TODAY = 2026-03-20.
+TODAY = {today}.
 If no date specified: use today for invoices/payments; for projects use today as start_date.
 
 ══════════════════════════════════════════════
@@ -280,10 +281,23 @@ def _parse_task_sync(prompt: str, files: list[FileAttachment]) -> dict[str, Any]
     """
     # Quick keyword hint so few-shot retrieval can pick relevant examples
     # before the LLM runs (avoids a second LLM call).
-    from agent.executor import _keyword_fallback  # lightweight import
+    from agent.executor import _keyword_fallback, _is_not_supported  # lightweight import
+
+    # Fast-path: if the prompt is clearly unsupported (payroll etc.), skip LLM
+    if _is_not_supported(prompt):
+        logger.info("Parser fast-path: prompt is not supported (payroll/dimensions), returning unknown")
+        return {
+            "task_type": "unknown",
+            "confidence": 1.0,
+            "language_detected": "unknown",
+            "missing_fields": [],
+        }
+
     task_hint = _keyword_fallback(prompt)
 
     few_shot_block = _get_few_shots(task_hint if task_hint != "unknown" else None)
+
+    system_prompt = _SYSTEM_PROMPT_TEMPLATE.format(today=date.today().isoformat())
 
     parts: list[types.Part] = []
     if few_shot_block:
@@ -309,7 +323,7 @@ def _parse_task_sync(prompt: str, files: list[FileAttachment]) -> dict[str, Any]
         model=_MODEL,
         contents=parts,
         config=types.GenerateContentConfig(
-            system_instruction=_SYSTEM_PROMPT,
+            system_instruction=system_prompt,
             temperature=0,
             max_output_tokens=1024,
         ),

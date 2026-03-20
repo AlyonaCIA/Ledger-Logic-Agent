@@ -59,6 +59,16 @@ def execute_task(intent: dict[str, Any], client: TripletexClient) -> None:
     language = intent.get("language_detected", "?")
     missing = intent.get("missing_fields") or []
 
+    # ── Hard blacklist: override LLM regardless of confidence ──────────────────
+    # Payroll/salary and other unsupported tasks must NEVER execute, even if the
+    # LLM assigns them to a real task_type at conf=0.50.
+    _raw = intent.get("_raw_prompt", "")
+    if _raw and _is_not_supported(_raw):
+        logger.warning(f"Blacklisted task (payroll/unsupported): task_type was {task_type!r}, forcing unknown")
+        task_type = "unknown"
+        intent["task_type"] = "unknown"
+        confidence = 1.0  # confident it's unsupported
+
     # ── Keyword fallback: rescue "unknown" or low-conf with simple heuristics ──
     if task_type == "unknown" or confidence < 0.25:
         task_type = _keyword_fallback(intent.get("_raw_prompt", ""))
@@ -141,6 +151,29 @@ _KEYWORD_MAP: list[tuple[list[str], str]] = [
     # travel expense → create_travel_expense
     (["travel", "reise", "viaje", "voyage", "dienstreise", "utlegg", "expense"], "create_travel_expense"),
 ]
+
+
+_NOT_SUPPORTED_KEYWORDS: list[str] = [
+    # Payroll – unambiguous terms only (avoid over-blocking)
+    "payroll",
+    "run payroll",
+    "gehaltsabrechnung",
+    "lohnabrechnung",
+    "gehalt auszahlen",
+    "kjør lønn",
+    "nómina",
+    "folha de pagamento",
+    "fiche de paie",
+    # Free accounting dimensions
+    "fri regnskapsdimensjon",
+    "dimensión contable libre",
+]
+
+
+def _is_not_supported(prompt: str) -> bool:
+    """Return True if the prompt clearly describes an unsupported task."""
+    p = prompt.lower()
+    return any(kw in p for kw in _NOT_SUPPORTED_KEYWORDS)
 
 
 def _keyword_fallback(prompt: str) -> str:
