@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 from google import genai
@@ -249,7 +250,17 @@ def _parse_task_sync(prompt: str, files: list[FileAttachment]) -> dict[str, Any]
     Synchronous Gemini call. Wrap in asyncio.get_event_loop().run_in_executor
     for async contexts, or call directly in sync tests.
     """
-    parts: list[types.Part] = [types.Part.from_text(text=f"Task prompt:\n{prompt}")]
+    # Quick keyword hint so few-shot retrieval can pick relevant examples
+    # before the LLM runs (avoids a second LLM call).
+    from agent.executor import _keyword_fallback  # lightweight import
+    task_hint = _keyword_fallback(prompt)
+
+    few_shot_block = _get_few_shots(task_hint if task_hint != "unknown" else None)
+
+    parts: list[types.Part] = []
+    if few_shot_block:
+        parts.append(types.Part.from_text(text=few_shot_block))
+    parts.append(types.Part.from_text(text=f"Task prompt:\n{prompt}"))
 
     for f in files:
         if f.mime_type.startswith("image/"):
@@ -280,6 +291,79 @@ def _parse_task_sync(prompt: str, files: list[FileAttachment]) -> dict[str, Any]
     result = _safe_parse(raw)
     logger.info(f"Parsed intent: task={result.get('task_type')} conf={result.get('confidence'):.2f} lang={result.get('language_detected')}")
     return result
+
+
+# ------------------------------------------------------------------ #
+# Gold few-shot retrieval
+# ------------------------------------------------------------------ #
+
+_GOLD_PROMPTS: list[dict] | None = None
+_GOLD_PATH = Path("gold/prompts.jsonl")
+
+
+def _load_gold() -> list[dict]:
+    """Load gold examples once; return empty list if file absent."""
+    global _GOLD_PROMPTS
+    if _GOLD_PROMPTS is None:
+        _GOLD_PROMPTS = []
+        if _GOLD_PATH.exists():
+            with _GOLD_PATH.open(encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line:
+                        try:
+                            _GOLD_PROMPTS.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass
+            logger.debug(f"Loaded {len(_GOLD_PROMPTS)} gold examples from {_GOLD_PATH}")
+    return _GOLD_PROMPTS
+
+
+def _get_few_shots(task_type_hint: str | None = None, max_examples: int = 2) -> str:
+    """
+    Return a formatted few-shot block for the given task type (or all types).
+    Called before the LLM parse to inject 1–2 canonical examples.
+    The hint is derived from a quick keyword scan of the prompt.
+    """
+    gold = _load_gold()
+    if not gold:
+        return ""
+
+    # Filter by task type if we have a hint
+    candidates = gold
+    if task_type_hint:
+        typed = [g for g in gold if g.get("task_type") == task_type_hint]
+        if typed:
+            candidates = typed
+
+    # Take up to max_examples (pick diverse languages)
+    selected: list[dict] = []
+    seen_langs: set[str] = set()
+    for ex in candidates[:max_examples * 3]:  # scan a bit wider for diversity
+        lang = ex.get("language", "?")
+        if lang not in seen_langs:
+            selected.append(ex)
+            seen_langs.add(lang)
+        if len(selected) >= max_examples:
+            break
+
+    if not selected:
+        selected = candidates[:max_examples]
+
+    if not selected:
+        return ""
+
+    lines = ["\n══════════════════════════════════════════════",
+             "FEW-SHOT EXAMPLES (from verified gold dataset)",
+             "══════════════════════════════════════════════"]
+    for i, ex in enumerate(selected, 1):
+        lines.append(f"\nExample {i}:")
+        lines.append(f"  prompt: {ex.get('prompt', '')}")
+        entities = {k: v for k, v in ex.get("entities", {}).items() if k != "_raw_prompt"}
+        compact = json.dumps(entities, ensure_ascii=False)
+        lines.append(f"  output: {{\"task_type\": \"{ex.get('task_type')}\", \"confidence\": {ex.get('confidence', 1.0)}, \"language_detected\": \"{ex.get('language', '?')}\", \"missing_fields\": [], {compact[1:]}")
+    lines.append("")
+    return "\n".join(lines)
 
 
 async def parse_task(
