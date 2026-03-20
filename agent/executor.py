@@ -134,6 +134,8 @@ _KEYWORD_MAP: list[tuple[list[str], str]] = [
     (["project", "prosjekt", "proyecto", "projet", "projekt", "Projekt"], "create_project"),
     # payment → register_payment
     (["payment", "betaling", "pago", "pagamento", "zahlung", "paiement", "betal"], "register_payment"),
+    # payroll/salary → unknown (NOT supported in Tripletex API)
+    (["payroll", "salary", "lohn", "gehalt", "nómina", "salaire", "lønn", "loenning"], "unknown"),
     # credit note / kreditnota → create_credit_note
     (["credit note", "kreditnota", "nota de crédito", "avoir", "gutschrift"], "create_credit_note"),
     # travel expense → create_travel_expense
@@ -382,10 +384,10 @@ def _create_product(intent: dict, client: TripletexClient) -> None:
 # Valid Norwegian BBAN (MOD-11 verified: weights [5,4,3,2,7,6,5,4,3,2], check=0)
 _FALLBACK_BBAN = "00001234560"
 
-# Module-level cache: tracks base URLs where the bank account has been checked.
-# Avoids 1 redundant GET /ledger/account on every invoice within the same
-# Cloud Run instance lifetime (instances handle multiple sequential requests).
-_BANK_ACCOUNT_ENSURED: set[str] = set()
+# Module-level cache: tracks (base_url, session_token) pairs where the bank
+# account has been verified.  Keying by token ensures fresh evaluation sessions
+# (new token → potentially fresh sandbox) always re-check.
+_BANK_ACCOUNT_ENSURED: set[tuple[str, str]] = set()
 
 
 def _ensure_bank_account(client: TripletexClient) -> None:

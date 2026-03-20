@@ -91,6 +91,7 @@ create_invoice
   Extract under invoice: date (YYYY-MM-DD, default today), due_days (default 14).
   Extract order_lines: each line has description, count, unit_price_excl_vat.
   If a single amount is given with no line detail, make one line with that amount.
+  ALSO MATCHES (multilingual): "commande" / "bon de commande" (fr), "Rechnung" / "Bestellung" (de), "factura" / "pedido" (es), "fatura" (pt), "bestilling" (nb/nn).
 
 register_payment
   Register a payment against an existing invoice.
@@ -135,7 +136,13 @@ delete_voucher
   Put any identifying info in notes.
 
 NOT SUPPORTED — use task_type "unknown" for:
-  - Payroll / salary calculation ("run payroll", "kjør lønn", "nómina", "salaire", "Lohnabrechnung")
+  - Payroll / salary calculation:
+    en: run payroll, salary
+    nb/nn: kjør lønn, lønning, lønn
+    de: Gehaltsabrechnung, Lohnabrechnung, Gehalt auszahlen
+    es: nómina, ejecute la nómina
+    fr: salaire, fiche de paie
+    pt: folha de pagamento
   - Free accounting dimensions / free dimensions ("fri regnskapsdimensjon", "dimensión contable")
   - Any task not listed above
 
