@@ -207,14 +207,35 @@ def _find_invoice_for_customer(
     return resolve_invoice(client, customer_id=customer_id)
 
 
+_PAYMENT_TYPE_CACHE: dict[tuple[str, str], int] = {}
+
+
 def _get_default_payment_type(client: TripletexClient) -> int | None:
-    """Return the first available invoice payment type ID."""
+    """Return the best available invoice payment type ID (cached per session).
+
+    Prefers a type described as 'bank' / 'overføring' / 'konto' so that the
+    default is always a bank-transfer-style payment and not cash.
+    """
+    cache_key = (client.base_url, client.session_token)
+    if cache_key in _PAYMENT_TYPE_CACHE:
+        return _PAYMENT_TYPE_CACHE[cache_key]
     try:
         types = client.get_list(
             "/invoice/paymentType",
-            params={"fields": "id,description", "count": 10},
+            params={"fields": "id,description", "count": 20},
         )
-        return types[0]["id"] if types else None
+        if not types:
+            return None
+        # Prefer bank-transfer type over cash
+        _BANK_KEYWORDS = ("bank", "overføring", "transfer", "konto", "giro")
+        preferred = next(
+            (t for t in types if any(kw in (t.get("description") or "").lower() for kw in _BANK_KEYWORDS)),
+            types[0],
+        )
+        result = preferred["id"]
+        _PAYMENT_TYPE_CACHE[cache_key] = result
+        logger.info(f"Cached payment type id={result} ({preferred.get('description')!r}) for session")
+        return result
     except Exception:
         return None
 
