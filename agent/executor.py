@@ -726,14 +726,20 @@ def _create_travel_expense(intent: dict, client: TripletexClient) -> None:
     from_date = te.get("from_date") or TODAY
     to_date = te.get("to_date") or from_date
 
+    is_foreign = bool(te.get("is_foreign_travel"))
+    travel_details: dict = {
+        "isForeignTravel": is_foreign,
+        "isDayTrip": from_date == to_date,
+        "departureDate": from_date,
+        "returnDate": to_date,
+    }
+    if te.get("description"):
+        travel_details["purpose"] = te["description"]
+
     payload: dict = {
         "employee": {"id": employee["id"]},
-        "travelDetails": {
-            "isForeignTravel": bool(te.get("is_foreign_travel")),
-        },
-        "comment": te.get("description") or "",
-        "from": from_date,
-        "to": to_date,
+        "travelDetails": travel_details,
+        "title": te.get("description") or "Business trip",
     }
 
     result = client.post_value("/travelExpense", json=payload)
@@ -827,27 +833,33 @@ def _create_project(intent: dict, client: TripletexClient) -> None:
 # Department workflow
 # ======================================================================
 
-def _create_department(intent: dict, client: TripletexClient) -> None:
-    dept = intent.get("department") or {}
+def _create_one_department(client: TripletexClient, dept: dict) -> None:
+    """Create a single department from a dept dict."""
     name = dept.get("name")
     if not name:
         return
-
-    # Optimistic POST — fresh accounts never have duplicate departments.
-    # If 422 fires (reused account / local simulator), log and skip.
     payload: dict = {"name": name}
     if dept.get("department_number"):
         payload["departmentNumber"] = dept["department_number"]
-
     try:
         result = _post_value_with_heal(client, "/department", payload)
         if result:
-            logger.info(f"Created department id={result.get('id')}")
+            logger.info(f"Created department id={result.get('id')} name={name!r}")
     except requests.exceptions.HTTPError as exc:
         if exc.response is not None and exc.response.status_code in (400, 422):
             logger.info(f"Department '{name}' likely already exists, skipping")
         else:
             raise
+
+
+def _create_department(intent: dict, client: TripletexClient) -> None:
+    dept_raw = intent.get("department")
+    if not dept_raw:
+        return
+    # Parser may return a list when asked to create multiple departments
+    depts: list[dict] = dept_raw if isinstance(dept_raw, list) else [dept_raw]
+    for dept in depts:
+        _create_one_department(client, dept)
 
 
 # ======================================================================
@@ -889,16 +901,30 @@ def _enable_module(intent: dict, client: TripletexClient) -> None:
 
 def _delete_voucher(intent: dict, client: TripletexClient) -> None:
     try:
+        date_from = (date.today() - timedelta(days=365 * 3)).isoformat()
+        date_to = (date.today() + timedelta(days=1)).isoformat()
+        notes = (intent.get("notes") or "").lower()
         vouchers = client.get_list(
             "/ledger/voucher",
-            params={"fields": "id,number,description,date", "count": 100},
+            params={
+                "fields": "id,number,description,date",
+                "count": 100,
+                "dateFrom": date_from,
+                "dateTo": date_to,
+            },
         )
         if not vouchers:
             logger.warning("No vouchers found to delete")
             return
 
-        # Delete the most recently posted voucher (last in list)
+        # Try to match by notes/description; fall back to most recently posted
         target = vouchers[-1]
+        if notes:
+            for v in reversed(vouchers):
+                if any(w in (v.get("description") or "").lower() for w in notes.split()):
+                    target = v
+                    break
+
         client.delete(f"/ledger/voucher/{target['id']}")
         logger.info(f"Deleted voucher id={target['id']} number={target.get('number')}")
     except Exception as exc:

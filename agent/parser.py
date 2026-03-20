@@ -106,7 +106,8 @@ create_credit_note
 create_travel_expense
   Create a travel expense report for an employee.
   Extract under employee: identifier (name to find them).
-  Extract under travel_expense: description, from_date, to_date, amount, is_foreign_travel.
+  Extract under travel_expense: description, from_date (YYYY-MM-DD), to_date (YYYY-MM-DD), amount, is_foreign_travel.
+  NOTE: do NOT use this for payroll/salary tasks — those are "unknown".
 
 delete_travel_expense
   Delete a travel expense report.
@@ -119,8 +120,11 @@ create_project
   Extract under customer: name (to find/create customer).
 
 create_department
-  Create a department.
-  Extract under department: name (the full department name as given, including any words or numbers), department_number (only if an explicit numeric code/ID is given separately from the name, e.g. "avdelingsnummer 100" or "number 100"; omit if the number is part of the name).
+  Create one or more departments.
+  If the prompt asks to create MULTIPLE departments, output "department" as a JSON array.
+  Each element: {"name": "...", "department_number": null}.
+  If only one department, output "department" as a single object (not an array).
+  department_number: only if an explicit numeric code/ID is given separately from the name.
 
 enable_module
   Enable a Tripletex module (department accounting, project accounting, travel expenses, etc.).
@@ -129,6 +133,11 @@ enable_module
 delete_voucher
   Delete / reverse an incorrect ledger entry or voucher.
   Put any identifying info in notes.
+
+NOT SUPPORTED — use task_type "unknown" for:
+  - Payroll / salary calculation ("run payroll", "kjør lønn", "nómina", "salaire", "Lohnabrechnung")
+  - Free accounting dimensions / free dimensions ("fri regnskapsdimensjon", "dimensión contable")
+  - Any task not listed above
 
 ══════════════════════════════════════════════
 DATES
