@@ -397,7 +397,8 @@ def _ensure_bank_account(client: TripletexClient) -> None:
     Norwegian BBAN so that POST /invoice stops returning 422
     "Faktura kan ikke opprettes før selskapet har registrert et bankkontonummer."
     """
-    if client.base_url in _BANK_ACCOUNT_ENSURED:
+    _cache_key = (client.base_url, client.session_token)
+    if _cache_key in _BANK_ACCOUNT_ENSURED:
         return
     try:
         accounts = client.get_list(
@@ -417,7 +418,7 @@ def _ensure_bank_account(client: TripletexClient) -> None:
             None,
         )
         if target is None:
-            _BANK_ACCOUNT_ENSURED.add(client.base_url)  # already configured
+            _BANK_ACCOUNT_ENSURED.add(_cache_key)  # already configured
             return
         acct_id = target["id"]
         client.put_value(
@@ -434,7 +435,7 @@ def _ensure_bank_account(client: TripletexClient) -> None:
                 "bankAccountCountry": {"id": 161},  # Norway
             },
         )
-        _BANK_ACCOUNT_ENSURED.add(client.base_url)
+        _BANK_ACCOUNT_ENSURED.add(_cache_key)
         logger.info(
             f"Registered bank account {_FALLBACK_BBAN} on ledger account {acct_id} "
             f"(number={target.get('number')}) — invoice creation now unblocked"

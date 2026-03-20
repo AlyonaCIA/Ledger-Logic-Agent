@@ -43,6 +43,7 @@ class TripletexClient:
         max_calls: int = MAX_CALLS_PER_REQUEST,
     ) -> None:
         self.base_url = base_url.rstrip("/")
+        self.session_token = session_token  # exposed for cache-keying in executor
         self.max_calls = max_calls
 
         # Metrics
