@@ -172,25 +172,16 @@ def _find_invoice_for_customer(
     return resolve_invoice(client, customer_id=customer_id)
 
 
-# Process-level cache for stable IDs (department, payment type).
-# Cloud Run keeps processes warm between requests; caching avoids
-# redundant API calls and improves efficiency scores.
-_STABLE_ID_CACHE: dict[str, int | None] = {}
-
-
 def _get_default_payment_type(client: TripletexClient) -> int | None:
-    """Return the first available payment type ID (cached per process)."""
-    cache_key = "payment_type"
-    if cache_key not in _STABLE_ID_CACHE:
-        try:
-            types = client.get_list(
-                "/ledger/paymentType",
-                params={"fields": "id,description", "count": 10},
-            )
-            _STABLE_ID_CACHE[cache_key] = types[0]["id"] if types else None
-        except Exception:
-            _STABLE_ID_CACHE[cache_key] = None
-    return _STABLE_ID_CACHE[cache_key]
+    """Return the first available payment type ID."""
+    try:
+        types = client.get_list(
+            "/ledger/paymentType",
+            params={"fields": "id,description", "count": 10},
+        )
+        return types[0]["id"] if types else None
+    except Exception:
+        return None
 
 
 # ======================================================================
@@ -198,20 +189,23 @@ def _get_default_payment_type(client: TripletexClient) -> int | None:
 # ======================================================================
 
 def _get_default_department_id(client: TripletexClient) -> int | None:
-    """Return an existing department id, or create one if none exist (cached)."""
-    cache_key = "department_id"
-    if cache_key not in _STABLE_ID_CACHE:
-        try:
-            depts = client.get_list("/department", params={"fields": "id", "count": 1})
-            if depts:
-                _STABLE_ID_CACHE[cache_key] = depts[0]["id"]
-            else:
-                # No department exists – create a default one
-                dept = client.post_value("/department", json={"name": "General"})
-                _STABLE_ID_CACHE[cache_key] = dept["id"] if dept else None
-        except Exception:
-            _STABLE_ID_CACHE[cache_key] = None
-    return _STABLE_ID_CACHE[cache_key]
+    """Return a department id.
+
+    Optimistic path: POST 'General' directly (fresh account → always succeeds,
+    saves the GET /department call that would return 0 results anyway).
+    Fallback: if the POST returns 422 (department already exists), GET to find it.
+    """
+    try:
+        dept = client.post_value("/department", json={"name": "General"})
+        return dept["id"] if dept else None
+    except requests.exceptions.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code in (400, 422):
+            try:
+                depts = client.get_list("/department", params={"fields": "id", "count": 1})
+                return depts[0]["id"] if depts else None
+            except Exception:
+                return None
+        return None
 
 
 def _create_employee(intent: dict, client: TripletexClient) -> None:
@@ -389,17 +383,18 @@ def _create_invoice(intent: dict, client: TripletexClient) -> None:
     cust_data = intent.get("customer") or {}
     inv_data = intent.get("invoice") or {}
 
-    # ── Step 1: find or create customer ──────────────────────────────
+    # ── Step 1: create customer (optimistic — fresh account is always empty) ──
+    # Skip the GET lookup to save an API call and preserve the efficiency bonus.
+    # If POST fails with 409/422 (customer exists), fall back to a GET lookup.
     customer = None
-    lookup_name = cust_data.get("identifier") or cust_data.get("name")
-    if lookup_name:
-        customer = _find_customer(client, lookup_name)
-
-    if not customer and cust_data.get("name"):
+    if cust_data.get("name"):
         cust_payload: dict = {"isCustomer": True, "name": cust_data["name"]}
         if cust_data.get("email"):
             cust_payload["email"] = cust_data["email"]
-        customer = _post_value_with_heal(client, "/customer", cust_payload)
+        try:
+            customer = _post_value_with_heal(client, "/customer", cust_payload)
+        except Exception:
+            customer = _find_customer(client, cust_data["name"])
 
     if not customer:
         logger.error("Cannot create invoice: no customer resolved")
@@ -720,21 +715,20 @@ def _create_project(intent: dict, client: TripletexClient) -> None:
     proj = intent.get("project") or {}
     cust_data = intent.get("customer") or {}
 
-    # ── Find or create customer ───────────────────────────────────────
+    # ── Create customer (optimistic — skip GET on fresh account) ─────
     customer: dict | None = None
     if cust_data.get("name"):
-        customer = _find_customer(client, cust_data["name"])
-        if not customer:
-            cust_payload: dict = {"isCustomer": True, "name": cust_data["name"]}
-            if cust_data.get("email"):
-                cust_payload["email"] = cust_data["email"]
-            customer = client.post_value("/customer", json=cust_payload)
+        cust_payload: dict = {"isCustomer": True, "name": cust_data["name"]}
+        if cust_data.get("email"):
+            cust_payload["email"] = cust_data["email"]
+        try:
+            customer = _post_value_with_heal(client, "/customer", cust_payload)
+        except Exception:
+            customer = _find_customer(client, cust_data["name"])
 
-    # ── Find a project manager (first available employee) ────────────
-    employees = client.get_list(
-        "/employee", params={"fields": "id,firstName,lastName", "count": 5}
-    )
-    manager = employees[0] if employees else None
+    # Skip employee lookup — fresh accounts have no employees and Tripletex
+    # accepts projects without an explicit projectManager.
+    manager = None
 
     start_date = proj.get("start_date") or TODAY
 
@@ -768,24 +762,21 @@ def _create_department(intent: dict, client: TripletexClient) -> None:
     if not name:
         return
 
-    # Idempotency: skip creation if a department with this exact name already exists.
-    # Tripletex returns 422 on duplicate departmentNumber, so search first.
-    try:
-        existing = client.get_list("/department", params={"name": name, "fields": "id,name", "count": 10})
-        for d in existing:
-            if d.get("name", "").lower() == name.lower():
-                logger.info(f"Department '{name}' already exists (id={d['id']}), skipping")
-                return
-    except Exception:
-        pass
-
+    # Optimistic POST — fresh accounts never have duplicate departments.
+    # If 422 fires (reused account / local simulator), log and skip.
     payload: dict = {"name": name}
     if dept.get("department_number"):
         payload["departmentNumber"] = dept["department_number"]
 
-    result = client.post_value("/department", json=payload)
-    if result:
-        logger.info(f"Created department id={result.get('id')}")
+    try:
+        result = _post_value_with_heal(client, "/department", payload)
+        if result:
+            logger.info(f"Created department id={result.get('id')}")
+    except requests.exceptions.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code in (400, 422):
+            logger.info(f"Department '{name}' likely already exists, skipping")
+        else:
+            raise
 
 
 # ======================================================================
