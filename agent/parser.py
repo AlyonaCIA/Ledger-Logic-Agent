@@ -138,6 +138,18 @@ TODAY = 2026-03-20.
 If no date specified: use today for invoices/payments; for projects use today as start_date.
 
 ══════════════════════════════════════════════
+ATTACHMENTS & OCR
+══════════════════════════════════════════════
+If an image or PDF is attached:
+1. Identify what it contains: Invoice, Receipt/travel expense, or identity document.
+2. Extract: TOTAL AMOUNT, DATE (YYYY-MM-DD), VENDOR/SUPPLIER NAME, and any INVOICE NUMBER.
+3. For travel receipts: also extract employee name and whether travel was foreign.
+4. When the text prompt is vague (e.g. "process this receipt", "faktura vedlagt"),
+   fill entity fields primarily from the file content, not the prompt.
+5. If the file clearly shows an invoice, set task_type = "create_invoice" or
+   "register_payment" based on context.
+
+══════════════════════════════════════════════
 AMOUNTS
 ══════════════════════════════════════════════
 Extract numeric values only (strip currency symbols: kr, NOK, €, $, £, etc.).
