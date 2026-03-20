@@ -173,10 +173,10 @@ def _find_invoice_for_customer(
 
 
 def _get_default_payment_type(client: TripletexClient) -> int | None:
-    """Return the first available payment type ID."""
+    """Return the first available invoice payment type ID."""
     try:
         types = client.get_list(
-            "/ledger/paymentType",
+            "/invoice/paymentType",
             params={"fields": "id,description", "count": 10},
         )
         return types[0]["id"] if types else None
