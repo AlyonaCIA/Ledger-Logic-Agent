@@ -29,9 +29,12 @@ build/
 logs/*.jsonl
 # root-level legacy episode file
 episodes.jsonl
+# Gold dataset — generated, not source-controlled
+gold/*.jsonl
 
 # Keep the directory itself tracked via .gitkeep
 !logs/.gitkeep
+!gold/.gitkeep
 
 # ── Cloud Run / deploy artefacts ──────────────────────────────────────────
 .cloud-run-url

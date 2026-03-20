@@ -3,7 +3,7 @@
 
 .DEFAULT_GOAL := help
 
-.PHONY: help dev test shadow simulate deploy smoke analyze logs-fetch clean
+.PHONY: help dev test shadow simulate deploy smoke analyze logs-fetch gold critique loop clean
 
 PYTHON  := .venv/bin/python
 TARGET  ?= http://localhost:8080
@@ -35,6 +35,20 @@ analyze:             ## Fetch last 30 min of episodes and print insights
 
 logs-fetch:          ## Fetch all stored episodes from Cloud Logging
 	$(PYTHON) scripts/analyze.py --fetch
+
+gold:                ## Build gold few-shot dataset from logs/episodes.jsonl
+	$(PYTHON) scripts/gold_builder.py
+
+gold-fetch:          ## Build gold dataset after fetching fresh Cloud Logging episodes
+	$(PYTHON) scripts/gold_builder.py --fetch
+
+critique:            ## Run LLM critic on all failed episodes in logs/episoodes.jsonl
+	$(PYTHON) scripts/critic.py
+
+loop:                ## Full offline improvement loop: fetch → gold → critique
+	$(PYTHON) scripts/analyze.py --fetch --freshness 1h
+	$(PYTHON) scripts/gold_builder.py
+	$(PYTHON) scripts/critic.py
 
 clean:               ## Remove Python bytecode and cache files
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
