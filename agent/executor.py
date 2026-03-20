@@ -382,6 +382,11 @@ def _create_product(intent: dict, client: TripletexClient) -> None:
 # Valid Norwegian BBAN (MOD-11 verified: weights [5,4,3,2,7,6,5,4,3,2], check=0)
 _FALLBACK_BBAN = "00001234560"
 
+# Module-level cache: tracks base URLs where the bank account has been checked.
+# Avoids 1 redundant GET /ledger/account on every invoice within the same
+# Cloud Run instance lifetime (instances handle multiple sequential requests).
+_BANK_ACCOUNT_ENSURED: set[str] = set()
+
 
 def _ensure_bank_account(client: TripletexClient) -> None:
     """Ensure the company has a bank account number on its invoice ledger account.
@@ -392,6 +397,8 @@ def _ensure_bank_account(client: TripletexClient) -> None:
     Norwegian BBAN so that POST /invoice stops returning 422
     "Faktura kan ikke opprettes før selskapet har registrert et bankkontonummer."
     """
+    if client.base_url in _BANK_ACCOUNT_ENSURED:
+        return
     try:
         accounts = client.get_list(
             "/ledger/account",
@@ -410,7 +417,8 @@ def _ensure_bank_account(client: TripletexClient) -> None:
             None,
         )
         if target is None:
-            return  # already configured or not found
+            _BANK_ACCOUNT_ENSURED.add(client.base_url)  # already configured
+            return
         acct_id = target["id"]
         client.put_value(
             f"/ledger/account/{acct_id}",
@@ -426,6 +434,7 @@ def _ensure_bank_account(client: TripletexClient) -> None:
                 "bankAccountCountry": {"id": 161},  # Norway
             },
         )
+        _BANK_ACCOUNT_ENSURED.add(client.base_url)
         logger.info(
             f"Registered bank account {_FALLBACK_BBAN} on ledger account {acct_id} "
             f"(number={target.get('number')}) — invoice creation now unblocked"
@@ -637,17 +646,25 @@ def _register_payment(intent: dict, client: TripletexClient) -> None:
     amount = pay_data.get("amount") or invoice.get("amountOutstanding") or invoice.get("amountCurrency")
     pay_date = pay_data.get("date") or TODAY
 
-    # Get a valid payment type
+    # Get a valid payment type (required by the /:payment endpoint)
     payment_type_id = _get_default_payment_type(client)
 
-    pay_payload: dict = {
-        "paymentDate": pay_date,
-        "paidAmount": amount,
-    }
-    if payment_type_id:
-        pay_payload["paymentTypeId"] = payment_type_id
+    if not payment_type_id:
+        logger.error("No payment type found — cannot register payment")
+        return
+    if not amount:
+        logger.error("No payment amount determined — cannot register payment")
+        return
 
-    result = client.post_value(f"/invoice/{invoice_id}/payment", json=pay_payload)
+    # Correct Tripletex action endpoint: PUT /invoice/{id}/:payment with all params in query
+    # (openapi.json: paymentDate, paymentTypeId, paidAmount are all required query params)
+    data = client.put(
+        f"/invoice/{invoice_id}/:payment"
+        f"?paymentDate={pay_date}"
+        f"&paymentTypeId={payment_type_id}"
+        f"&paidAmount={amount}"
+    )
+    result = (data or {}).get("value")
     if result:
         logger.info(f"Registered payment on invoice id={invoice_id}")
 
@@ -672,9 +689,16 @@ def _create_credit_note(intent: dict, client: TripletexClient) -> None:
         ident = inv_data.get("identifier")
         if ident:
             try:
+                date_from = (date.today() - timedelta(days=365 * 5)).isoformat()
+                date_to = (date.today() + timedelta(days=365)).isoformat()
                 results = client.get_list(
                     "/invoice",
-                    params={"invoiceNumber": ident, "count": 5},
+                    params={
+                        "invoiceNumber": ident,
+                        "invoiceDateFrom": date_from,
+                        "invoiceDateTo": date_to,
+                        "count": 5,
+                    },
                 )
                 if results:
                     invoice = results[0]
@@ -686,12 +710,15 @@ def _create_credit_note(intent: dict, client: TripletexClient) -> None:
         return
 
     credit_date = inv_data.get("date") or TODAY
-    result = client.post_value(
-        f"/invoice/{invoice['id']}/creditNote",
-        json={"creditNoteDate": credit_date},
+    # Correct Tripletex action endpoint: PUT /:createCreditNote?date=...&sendToCustomer=false
+    # (openapi.json confirms this is PUT with all params in the query string, no body)
+    data = client.put(
+        f"/invoice/{invoice['id']}/:createCreditNote"
+        f"?date={credit_date}&sendToCustomer=false"
     )
+    result = (data or {}).get("value")
     if result:
-        logger.info(f"Created credit note for invoice id={invoice['id']}")
+        logger.info(f"Created credit note id={result.get('id')} for invoice id={invoice['id']}")
 
 
 # ======================================================================
