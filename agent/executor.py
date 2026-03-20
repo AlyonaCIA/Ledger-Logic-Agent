@@ -434,8 +434,6 @@ def _create_invoice(intent: dict, client: TripletexClient) -> None:
         "orderDate": invoice_date,
         "deliveryDate": invoice_date,
     }
-    if order_lines:
-        order_payload["orderLines"] = order_lines
 
     order = _post_value_with_heal(client, "/order", order_payload)
     if not order:
@@ -444,15 +442,18 @@ def _create_invoice(intent: dict, client: TripletexClient) -> None:
 
     order_id = order["id"]
 
-    # Post order lines separately as fallback — some environments don't persist
-    # inline orderLines on POST /order.  The Tripletex v2 endpoint for adding a
-    # line is POST /orderline (singular) with the parent order in the body.
-    if order_lines and not (order.get("orderLines") or order.get("lines")):
-        for line in order_lines:
-            try:
-                client.post("/orderline", json={**line, "order": {"id": order_id}})
-            except Exception:
-                pass  # swallow — inline lines were already sent in the order payload
+    # Tripletex ignores inline orderLines on POST /order — must add separately.
+    # Correct Tripletex v2 path is POST /order/orderline (NOT /orderline).
+    # This was the root cause of 0% invoice success in competition runs.
+    lines_added = 0
+    for line in order_lines:
+        try:
+            client.post("/order/orderline", json={**line, "order": {"id": order_id}})
+            lines_added += 1
+        except Exception as exc:
+            logger.warning(f"Failed to add order line: {exc}")
+    if order_lines and lines_added == 0:
+        logger.error(f"Could not add any order lines to order {order_id} — invoice will likely fail")
 
     # ── Step 4: create invoice and send it ────────────────────────────
     # sendToCustomer=true so the invoice moves from Draft → Sent, which
