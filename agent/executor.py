@@ -15,12 +15,38 @@ import time
 from datetime import date, timedelta
 from typing import Any
 
+import requests
+
 from agent.client import TripletexClient
 from agent.matchers import resolve_customer, resolve_employee, resolve_invoice
 from agent.validators import ValidationError, validate_intent
 
 logger = logging.getLogger(__name__)
 TODAY = date.today().isoformat()
+
+
+# ======================================================================
+# Self-Healing helper
+# ======================================================================
+
+def _post_value_with_heal(client: TripletexClient, path: str, json_payload: dict) -> Any:
+    """
+    POST with a single self-healing retry on 400/422 errors.
+    Tripletex returns detailed validationMessages on these status codes;
+    we forward them to Gemini Flash which fixes the payload and we retry once.
+    Falls back to raising the original exception if healing produces no change.
+    """
+    try:
+        return client.post_value(path, json=json_payload)
+    except requests.exceptions.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code in (400, 422):
+            error_text = exc.response.text
+            logger.warning(f"422 on {path} – triggering self-heal. Error: {error_text[:200]}")
+            from agent.healer import heal_payload  # lazy – avoids circular import at load time
+            healed = heal_payload(path, json_payload, error_text)
+            if healed != json_payload:
+                return client.post_value(path, json=healed)
+        raise
 
 
 # ======================================================================
@@ -208,7 +234,7 @@ def _create_employee(intent: dict, client: TripletexClient) -> None:
     if dept_id:
         payload["department"] = {"id": dept_id}
 
-    result = client.post_value("/employee", json=payload)
+    result = _post_value_with_heal(client, "/employee", payload)
     if result:
         logger.info(f"Created employee id={result.get('id')}")
 
@@ -281,7 +307,7 @@ def _create_customer(intent: dict, client: TripletexClient) -> None:
     if cust.get("org_number"):
         payload["organizationNumber"] = cust["org_number"]
 
-    result = client.post_value("/customer", json=payload)
+    result = _post_value_with_heal(client, "/customer", payload)
     if result:
         logger.info(f"Created customer id={result.get('id')}")
 
@@ -350,7 +376,7 @@ def _create_product(intent: dict, client: TripletexClient) -> None:
         # We set the display unit via the unit field if available
         pass
 
-    result = client.post_value("/product", json=payload)
+    result = _post_value_with_heal(client, "/product", payload)
     if result:
         logger.info(f"Created product id={result.get('id')}")
 
@@ -373,7 +399,7 @@ def _create_invoice(intent: dict, client: TripletexClient) -> None:
         cust_payload: dict = {"isCustomer": True, "name": cust_data["name"]}
         if cust_data.get("email"):
             cust_payload["email"] = cust_data["email"]
-        customer = client.post_value("/customer", json=cust_payload)
+        customer = _post_value_with_heal(client, "/customer", cust_payload)
 
     if not customer:
         logger.error("Cannot create invoice: no customer resolved")
@@ -416,7 +442,7 @@ def _create_invoice(intent: dict, client: TripletexClient) -> None:
     if order_lines:
         order_payload["orderLines"] = order_lines
 
-    order = client.post_value("/order", json=order_payload)
+    order = _post_value_with_heal(client, "/order", order_payload)
     if not order:
         logger.error("Failed to create order")
         return
@@ -439,15 +465,17 @@ def _create_invoice(intent: dict, client: TripletexClient) -> None:
     # configured), we retry with sendToCustomer=false and then explicitly
     # call /:send so the invoice at least exists in a non-draft state.
     invoice = None
+    invoice_body = {
+        "invoiceDate": invoice_date,
+        "invoiceDueDate": due_date,
+        "orders": [{"id": order_id}],
+    }
     for send_flag in ("true", "false"):
         try:
-            invoice = client.post_value(
+            invoice = _post_value_with_heal(
+                client,
                 f"/invoice?sendToCustomer={send_flag}",
-                json={
-                    "invoiceDate": invoice_date,
-                    "invoiceDueDate": due_date,
-                    "orders": [{"id": order_id}],
-                },
+                invoice_body,
             )
             break
         except Exception:
