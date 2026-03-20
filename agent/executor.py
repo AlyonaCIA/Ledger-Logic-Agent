@@ -16,6 +16,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from agent.client import TripletexClient
+from agent.matchers import resolve_customer, resolve_employee, resolve_invoice
 from agent.validators import ValidationError, validate_intent
 
 logger = logging.getLogger(__name__)
@@ -128,78 +129,21 @@ def _keyword_fallback(prompt: str) -> str:
 # Shared helpers
 # ======================================================================
 
+# Thin wrappers kept for backward-compatibility with tests that import them.
+# All new code should import from agent.matchers directly.
+
 def _find_customer(client: TripletexClient, name: str | None) -> dict | None:
-    """Search customer by name; return exact-name match or None."""
-    if not name:
-        return None
-    # Tripletex name filter does substring/word matching, not exact match.
-    # Fetch up to 500 and filter precisely to avoid using the wrong customer.
-    results = client.get_list(
-        "/customer",
-        params={"name": name, "count": 500},
-    )
-    name_lower = name.lower()
-    for r in results:
-        if r.get("name", "").lower() == name_lower:
-            return r
-    return None
+    return resolve_customer(client, name)
 
 
 def _find_employee(client: TripletexClient, identifier: str | None) -> dict | None:
-    """Search employee by full name or email fragment."""
-    if not identifier:
-        return None
-    employees = client.get_list(
-        "/employee",
-        params={"fields": "id,firstName,lastName,email", "count": 200},
-    )
-    ident_lower = identifier.lower()
-    for e in employees:
-        full_name = f"{e.get('firstName', '')} {e.get('lastName', '')}".strip().lower()
-        email = (e.get("email") or "").lower()
-        if ident_lower in full_name or (email and ident_lower in email):
-            return e
-    return None
+    return resolve_employee(client, name=identifier)
 
 
 def _find_invoice_for_customer(
     client: TripletexClient, customer_id: int
 ) -> dict | None:
-    """Return the most recent unpaid invoice for a customer."""
-    # Some environments require invoiceDateFrom/To — use a wide range
-    date_from = (date.today() - timedelta(days=365 * 5)).isoformat()
-    date_to = (date.today() + timedelta(days=365)).isoformat()
-    # Try with customerId filter first (no 'fields' – proxy may reject it)
-    try:
-        invoices = client.get_list(
-            "/invoice",
-            params={"customerId": customer_id, "invoiceDateFrom": date_from, "invoiceDateTo": date_to, "count": 50},
-        )
-    except Exception:
-        invoices = []
-
-    # Fallback: get all recent invoices and filter client-side
-    # Some environments require invoiceDateFrom/To (sandbox requires them)
-    if not invoices:
-        try:
-            date_from = (date.today() - timedelta(days=365 * 5)).isoformat()
-            date_to = (date.today() + timedelta(days=365)).isoformat()
-            all_inv = client.get_list(
-                "/invoice",
-                params={"invoiceDateFrom": date_from, "invoiceDateTo": date_to, "count": 100},
-            )
-            invoices = [
-                i for i in all_inv
-                if (i.get("customer") or {}).get("id") == customer_id
-            ]
-        except Exception:
-            invoices = []
-
-    if not invoices:
-        return None
-    # Prefer invoices with outstanding balance
-    unpaid = [i for i in invoices if (i.get("amountOutstanding") or 0) > 0]
-    return unpaid[0] if unpaid else invoices[0]
+    return resolve_invoice(client, customer_id=customer_id)
 
 
 def _get_default_payment_type(client: TripletexClient) -> int | None:
