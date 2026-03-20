@@ -410,18 +410,21 @@ def _create_invoice(intent: dict, client: TripletexClient) -> None:
 
     order_id = order["id"]
 
-    # Post order lines separately as fallback — some environments ignore inline
-    # orderLines on POST /order (proxy/sandbox may return 404, which we swallow)
+    # Post order lines separately as fallback — some environments don't persist
+    # inline orderLines on POST /order.  The Tripletex v2 endpoint for adding a
+    # line is POST /orderline (singular) with the parent order in the body.
     if order_lines and not (order.get("orderLines") or order.get("lines")):
         for line in order_lines:
             try:
-                client.post(f"/order/{order_id}/orderLines", json=line)
+                client.post("/orderline", json={**line, "order": {"id": order_id}})
             except Exception:
-                pass  # 404 on sandbox/some proxies is expected; inline was already sent
+                pass  # swallow — inline lines were already sent in the order payload
 
     # ── Step 4: create invoice via /invoice endpoint ─────────────────
+    # sendToCustomer=false: skip email/EHF dispatch so invoice creation
+    # succeeds even when no send-method is configured in the sandbox.
     invoice = client.post_value(
-        "/invoice",
+        "/invoice?sendToCustomer=false",
         json={
             "invoiceDate": invoice_date,
             "invoiceDueDate": due_date,
