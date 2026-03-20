@@ -3,7 +3,8 @@
 AI agent that interprets natural-language accounting prompts (in **7 languages**) and executes the correct Tripletex ERP API calls — with self-healing retries, few-shot learning, and a full offline gold loop.
 
 Built for the [AINM Tripletex competition](https://app.ainm.no/submit/tripletex).  
-**Deployed revision:** `ledger-logic-agent-00016-lfj` · **Local simulator:** 12/14 tasks ✓
+**Deployed revision:** `ledger-logic-agent-00022-tmq` · **Score:** 33.6 (position 82)  
+**Locally verified:** create_invoice ✓ · create_credit_note ✓ · register_payment ✓ · create_employee ✓ · create_department ✓
 
 ---
 
@@ -37,8 +38,9 @@ Built for the [AINM Tripletex competition](https://app.ainm.no/submit/tripletex)
                         │   │  422 → Gemini fixes payload → retry once     │ │
                         │   └──────────────────────────────────────────────┘ │
                         │   ┌──────────────────────────────────────────────┐ │
-                        │   │  Stable-ID cache  (process-level dict)       │ │
-                        │   │  department_id · payment_type (no repeat GETs│ │
+                        │   │  Session-keyed cache  (process-level dict)   │ │
+                        │   │  bank_account · payment_type · department     │ │
+                        │   │  keyed by (base_url, session_token)          │ │
                         │   └──────────────────────────────────────────────┘ │
                         └───────────────────────┬────────────────────────────┘
                                                 │
@@ -164,7 +166,7 @@ make help
 
 ```bash
 curl https://ledger-logic-agent-xrgiacpg2q-ew.a.run.app/health
-# → {"status":"ok","version":"1.0.0","git_sha":"ledger-logic-agent-00016-lfj"}
+# → {"status":"ok","version":"1.0.0","git_sha":"ledger-logic-agent-00022-tmq"}
 ```
 
 **Rule:** the `git_sha` must change after every deploy before submitting to the competition.
