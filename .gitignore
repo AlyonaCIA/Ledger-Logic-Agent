@@ -27,7 +27,8 @@ build/
 *.tmp
 /tmp/
 logs/*.jsonl
-episodes.jsonl       # root-level legacy location
+# root-level legacy episode file
+episodes.jsonl
 
 # Keep the directory itself tracked via .gitkeep
 !logs/.gitkeep
