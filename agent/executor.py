@@ -146,16 +146,25 @@ def _find_invoice_for_customer(
     return resolve_invoice(client, customer_id=customer_id)
 
 
+# Process-level cache for stable IDs (department, payment type).
+# Cloud Run keeps processes warm between requests; caching avoids
+# redundant API calls and improves efficiency scores.
+_STABLE_ID_CACHE: dict[str, int | None] = {}
+
+
 def _get_default_payment_type(client: TripletexClient) -> int | None:
-    """Return the first available payment type ID."""
-    try:
-        types = client.get_list(
-            "/ledger/paymentType",
-            params={"fields": "id,description", "count": 10},
-        )
-        return types[0]["id"] if types else None
-    except Exception:
-        return None
+    """Return the first available payment type ID (cached per process)."""
+    cache_key = "payment_type"
+    if cache_key not in _STABLE_ID_CACHE:
+        try:
+            types = client.get_list(
+                "/ledger/paymentType",
+                params={"fields": "id,description", "count": 10},
+            )
+            _STABLE_ID_CACHE[cache_key] = types[0]["id"] if types else None
+        except Exception:
+            _STABLE_ID_CACHE[cache_key] = None
+    return _STABLE_ID_CACHE[cache_key]
 
 
 # ======================================================================
@@ -163,16 +172,20 @@ def _get_default_payment_type(client: TripletexClient) -> int | None:
 # ======================================================================
 
 def _get_default_department_id(client: TripletexClient) -> int | None:
-    """Return an existing department id, or create one if none exist."""
-    try:
-        depts = client.get_list("/department", params={"fields": "id", "count": 1})
-        if depts:
-            return depts[0]["id"]
-        # No department exists – create a default one
-        dept = client.post_value("/department", json={"name": "General"})
-        return dept["id"] if dept else None
-    except Exception:
-        return None
+    """Return an existing department id, or create one if none exist (cached)."""
+    cache_key = "department_id"
+    if cache_key not in _STABLE_ID_CACHE:
+        try:
+            depts = client.get_list("/department", params={"fields": "id", "count": 1})
+            if depts:
+                _STABLE_ID_CACHE[cache_key] = depts[0]["id"]
+            else:
+                # No department exists – create a default one
+                dept = client.post_value("/department", json={"name": "General"})
+                _STABLE_ID_CACHE[cache_key] = dept["id"] if dept else None
+        except Exception:
+            _STABLE_ID_CACHE[cache_key] = None
+    return _STABLE_ID_CACHE[cache_key]
 
 
 def _create_employee(intent: dict, client: TripletexClient) -> None:
@@ -723,10 +736,22 @@ def _create_project(intent: dict, client: TripletexClient) -> None:
 
 def _create_department(intent: dict, client: TripletexClient) -> None:
     dept = intent.get("department") or {}
+    name = dept.get("name")
+    if not name:
+        return
 
-    payload: dict = {}
-    if dept.get("name"):
-        payload["name"] = dept["name"]
+    # Idempotency: skip creation if a department with this exact name already exists.
+    # Tripletex returns 422 on duplicate departmentNumber, so search first.
+    try:
+        existing = client.get_list("/department", params={"name": name, "fields": "id,name", "count": 10})
+        for d in existing:
+            if d.get("name", "").lower() == name.lower():
+                logger.info(f"Department '{name}' already exists (id={d['id']}), skipping")
+                return
+    except Exception:
+        pass
+
+    payload: dict = {"name": name}
     if dept.get("department_number"):
         payload["departmentNumber"] = dept["department_number"]
 
