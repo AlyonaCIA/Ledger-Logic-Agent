@@ -1,0 +1,39 @@
+# ── Secrets – NEVER commit these ──────────────────────────────────────────
+.env
+.env.*
+!.env.example        # keep the template, not the real values
+secrets/
+*.key
+*.pem
+*.p12
+service-account*.json
+gcp-key*.json
+
+# ── Python ────────────────────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# ── uv / pip ──────────────────────────────────────────────────────────────
+.python-version
+
+# ── Logs & episode data (gold dataset – data files, not source) ───────────
+*.log
+*.tmp
+/tmp/
+logs/*.jsonl
+episodes.jsonl       # root-level legacy location
+
+# Keep the directory itself tracked via .gitkeep
+!logs/.gitkeep
+
+# ── Cloud Run / deploy artefacts ──────────────────────────────────────────
+.cloud-run-url
+
+# ── macOS ──────────────────────────────────────────────────────────────────
+.DS_Store
