@@ -15,6 +15,7 @@ import subprocess
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, Request
@@ -40,6 +41,13 @@ logger = logging.getLogger(__name__)
 
 # Separate logger that emits one JSON line per episode (easy to grep/export).
 episode_logger = logging.getLogger("episode")
+
+# ── Local episode log file (gold dataset for offline analysis) ────────────
+# In Cloud Run the filesystem is ephemeral; use `make logs-fetch` to pull from
+# Cloud Logging instead.  Locally this file accumulates across restarts.
+_LOGS_DIR = Path("logs")
+_LOGS_DIR.mkdir(exist_ok=True)
+_EPISODE_FILE = _LOGS_DIR / "episodes.jsonl"
 
 # Optional API key to protect the /solve endpoint (set via env var API_KEY).
 _API_KEY: str | None = os.getenv("API_KEY")
@@ -168,6 +176,13 @@ async def solve(
         "error": error_msg,
     }
     episode_logger.info("EPISODE %s", json.dumps(episode, ensure_ascii=False))
+
+    # Append to local gold-dataset file (best-effort; silent in Cloud Run).
+    try:
+        with _EPISODE_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(episode, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
     return JSONResponse({"status": "completed"})
 
