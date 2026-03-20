@@ -528,6 +528,8 @@ def _create_invoice(intent: dict, client: TripletexClient) -> None:
         "invoiceDueDate": due_date,
         "orders": [{"id": order_id}],
     }
+    invoice = None
+    sent_via_flag = False
     for send_flag in ("true", "false"):
         try:
             invoice = _post_value_with_heal(
@@ -535,6 +537,7 @@ def _create_invoice(intent: dict, client: TripletexClient) -> None:
                 f"/invoice?sendToCustomer={send_flag}",
                 invoice_body,
             )
+            sent_via_flag = (send_flag == "true")
             break
         except Exception:
             if send_flag == "false":
@@ -545,13 +548,15 @@ def _create_invoice(intent: dict, client: TripletexClient) -> None:
         logger.info(
             f"Created invoice id={invoice_id} number={invoice.get('invoiceNumber')}"
         )
-        # Explicit send call — moves invoice from Draft to Sent when the
-        # POST itself was made with sendToCustomer=false (fallback path).
-        try:
-            client.put(f"/invoice/{invoice_id}/:send", json={"sendToCustomer": True})
-            logger.info(f"Sent invoice id={invoice_id}")
-        except Exception:
-            pass  # already sent via query-param, or sandbox doesn't support it
+        # Only call /:send explicitly when the POST used sendToCustomer=false
+        # (i.e. the first attempt failed). When sendToCustomer=true was used,
+        # the invoice is already sent and the /:send call would 422.
+        if not sent_via_flag:
+            try:
+                client.put(f"/invoice/{invoice_id}/:send", json={"sendType": "EMAIL"})
+                logger.info(f"Sent invoice id={invoice_id}")
+            except Exception:
+                pass  # sandbox may not support email sending
 
 
 # ======================================================================
