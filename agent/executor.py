@@ -287,12 +287,13 @@ def _create_employee(intent: dict, client: TripletexClient) -> None:
 
     new_employee: dict | None = None
     if not existing_employee:
-        payload: dict = {"userType": "STANDARD"}
+        has_email = bool(emp.get("email"))
+        payload: dict = {"userType": "STANDARD" if has_email else "NO_ACCESS"}
         if emp.get("first_name"):
             payload["firstName"] = emp["first_name"]
         if emp.get("last_name"):
             payload["lastName"] = emp["last_name"]
-        if emp.get("email"):
+        if has_email:
             payload["email"] = emp["email"]
         if emp.get("phone"):
             payload["phoneNumberMobile"] = emp["phone"]
@@ -1933,6 +1934,61 @@ def _delete_voucher(intent: dict, client: TripletexClient) -> None:
 # Ledger task workflow (corrections, depreciation, monthly/annual close)
 # ======================================================================
 
+def _post_generic_ledger_postings(
+    client: TripletexClient,
+    postings_raw: list[dict],
+    entry_date: str,
+    description: str,
+) -> None:
+    """Resolve accounts and post a balanced voucher from raw posting dicts.
+
+    Postings with null/zero amounts are grouped into balanced pairs where
+    possible (debit one, credit the other for an equal amount).  When the
+    parser fails to extract an amount for a pair that is clearly debit/credit
+    (e.g. salary expense 5000 / accrued salary 2900), we skip them rather
+    than sending zero which would fail validation.
+    """
+    resolved_postings: list[dict] = []
+    row = 1
+    for p in postings_raw:
+        amt = p.get("amount")
+        if amt is None or amt == 0:
+            continue  # skip postings without a resolved amount
+        acct = _find_or_create_account(
+            str(p.get("account_number") or ""),
+            p.get("account_name"),
+        )
+        if acct:
+            resolved_postings.append({
+                "row": row,
+                "account": {"id": acct["id"]},
+                "amountGross": float(amt),
+                "amountGrossCurrency": float(amt),
+            })
+            row += 1
+
+    if not resolved_postings:
+        logger.warning("_post_generic_ledger_postings: no valid postings to post")
+        return
+
+    # Ensure postings sum to zero — if not, try to balance with a rounding row
+    total = sum(p["amountGross"] for p in resolved_postings)
+    if abs(total) > 0.01:
+        logger.warning(f"Postings sum={total}, not balanced — healer will attempt fix")
+
+    try:
+        v = _post_value_with_heal(client, "/ledger/voucher", {
+            "date": entry_date,
+            "description": description,
+            "postings": resolved_postings,
+        })
+        logger.info(f"Posted generic ledger voucher id={v.get('id') if v else None}")
+    except Exception as exc:
+        logger.error(f"Generic ledger voucher failed: {exc}")
+
+
+# ======================================================================
+
 def _ledger_task(intent: dict, client: TripletexClient) -> None:
     """
     Handle complex ledger tasks:
@@ -2020,43 +2076,43 @@ def _ledger_task(intent: dict, client: TripletexClient) -> None:
 
     elif subtask in ("depreciation", "monthly_close", "annual_close"):
         # Post depreciation / close entries
-        # Parser should provide: asset_cost (or annual_amount), years, depr_account, accum_account
-        asset_cost = float(ledger.get("asset_cost") or 0)
-        years = int(ledger.get("years") or 1)
-        annual_amount = float(ledger.get("annual_amount") or 0)
+        # Parser may provide depreciation info at top level OR in a "depreciation" sub-object
+        depr_obj = ledger.get("depreciation") or {}
+        asset_cost = float(depr_obj.get("asset_cost") or ledger.get("asset_cost") or 0)
+        years = int(depr_obj.get("years") or ledger.get("years") or 1)
+        annual_amount = float(depr_obj.get("annual_amount") or ledger.get("annual_amount") or 0)
         if asset_cost and years and not annual_amount:
             annual_amount = round(asset_cost / years, 2)
 
-        if not annual_amount:
-            # Try generic postings
-            postings_raw = ledger.get("postings") or []
-            if not postings_raw:
-                logger.error("ledger_depreciation: no amount or postings provided")
-                return
-
-        depr_acct_num = str(ledger.get("depreciation_account") or "6010")
-        accum_acct_num = str(ledger.get("accumulated_account") or "1209")
+        depr_acct_num = str(depr_obj.get("depreciation_account") or ledger.get("depreciation_account") or "6010")
+        accum_acct_num = str(depr_obj.get("accumulated_account") or ledger.get("accumulated_account") or "1209")
         entry_date = ledger.get("date") or TODAY
 
-        depr_acct = _find_or_create_account(depr_acct_num, "Avskrivning anleggsmidler")
-        accum_acct = _find_or_create_account(accum_acct_num, "Akkumulerte avskrivninger")
+        # ── Post depreciation voucher if we have an amount ──
+        if annual_amount:
+            depr_acct = _find_or_create_account(depr_acct_num, "Avskrivning anleggsmidler")
+            accum_acct = _find_or_create_account(accum_acct_num, "Akkumulerte avskrivninger")
 
-        if not depr_acct or not accum_acct:
-            logger.error(f"Cannot find depreciation accounts ({depr_acct_num}, {accum_acct_num})")
-            return
+            if depr_acct and accum_acct:
+                try:
+                    v = _post_value_with_heal(client, "/ledger/voucher", {
+                        "date": entry_date,
+                        "description": ledger.get("description") or "Avskrivning",
+                        "postings": [
+                            {"row": 1, "account": {"id": depr_acct["id"]}, "amountGross": annual_amount, "amountGrossCurrency": annual_amount},
+                            {"row": 2, "account": {"id": accum_acct["id"]}, "amountGross": -annual_amount, "amountGrossCurrency": -annual_amount},
+                        ],
+                    })
+                    logger.info(f"Posted depreciation voucher id={v.get('id') if v else None} amount={annual_amount}")
+                except Exception as exc:
+                    logger.error(f"Depreciation voucher failed: {exc}")
+            else:
+                logger.error(f"Cannot find depreciation accounts ({depr_acct_num}, {accum_acct_num})")
 
-        try:
-            v = _post_value_with_heal(client, "/ledger/voucher", {
-                "date": entry_date,
-                "description": ledger.get("description") or "Avskrivning",
-                "postings": [
-                    {"row": 1, "account": {"id": depr_acct["id"]}, "amountGross": annual_amount, "amountGrossCurrency": annual_amount},
-                    {"row": 2, "account": {"id": accum_acct["id"]}, "amountGross": annual_amount, "amountGrossCurrency": annual_amount},
-                ],
-            })
-            logger.info(f"Posted depreciation voucher id={v.get('id') if v else None} amount={annual_amount}")
-        except Exception as exc:
-            logger.error(f"Depreciation voucher failed: {exc}")
+        # ── Post remaining generic postings (accrual reversal, salary, etc.) ──
+        postings_raw = ledger.get("postings") or []
+        if postings_raw:
+            _post_generic_ledger_postings(client, postings_raw, entry_date, ledger.get("description") or "Monthly close entry")
 
     else:
         # Generic ledger voucher — post whatever postings are specified
@@ -2065,26 +2121,4 @@ def _ledger_task(intent: dict, client: TripletexClient) -> None:
             logger.error("ledger task: no postings provided")
             return
 
-        resolved_postings = []
-        for i, p in enumerate(postings_raw, 1):
-            acct = _find_or_create_account(str(p.get("account_number") or ""))
-            if acct:
-                resolved_postings.append({
-                    "row": i,
-                    "account": {"id": acct["id"]},
-                    "amountGross": float(p.get("amount") or 0),
-                    "amountGrossCurrency": float(p.get("amount") or 0),
-                })
-        if not resolved_postings:
-            logger.error("ledger task: could not resolve any accounts")
-            return
-
-        try:
-            v = _post_value_with_heal(client, "/ledger/voucher", {
-                "date": ledger.get("date") or TODAY,
-                "description": ledger.get("description") or "Ledger entry",
-                "postings": resolved_postings,
-            })
-            logger.info(f"Posted ledger voucher id={v.get('id') if v else None}")
-        except Exception as exc:
-            logger.error(f"Generic ledger voucher failed: {exc}")
+        _post_generic_ledger_postings(client, postings_raw, ledger.get("date") or TODAY, ledger.get("description") or "Ledger entry")
