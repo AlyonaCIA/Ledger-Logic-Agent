@@ -59,9 +59,10 @@ create_employee
   Create a new employee. Extract:
   - first_name, last_name, email, phone
   - start_date (YYYY-MM-DD): employment start date if mentioned
-  - annual_salary: yearly salary in NOK if mentioned (e.g. "660 000 kr/år" → 660000)
-  - work_percent: percentage of full-time employment if mentioned (e.g. "80 %" → 80)
-  - job_title: job title / occupation (e.g. "Regnskapssjef", "Software Engineer")
+  - annual_salary: yearly salary in NOK if mentioned (e.g. "660 000 kr/år" → 660000, "kr 920 000" → 920000)
+  - work_percent: percentage of full-time employment if mentioned (e.g. "80 %" → 80, "100%" → 100)
+  - job_title: job title / occupation / stillingskode (e.g. "Regnskapssjef", "Software Engineer", "Lagermedarbeider")
+  - occupation_code: numeric occupation code if explicitly given (e.g. "5223" from "stillingskode 5223")
   - date_of_birth (YYYY-MM-DD): birth date if mentioned
   - national_id_number: national ID / personnummer if mentioned
   - is_account_admin: TRUE if role is any of:
@@ -72,6 +73,10 @@ create_employee
     nn: kontoadministrator
     de: Kontoadministrator, Kontoverwaltung
     fr: administrateur de compte
+  IMPORTANT: For PDF employment contracts / arbeidsavtaler, extract ALL available
+  employment details — salary, work percentage, occupation, start date are
+  commonly included. Do NOT leave annual_salary/work_percent/job_title null
+  when the contract specifies them.
 
 update_employee
   Update existing employee fields. Use "identifier" for the name/email used to find them.
@@ -110,14 +115,17 @@ create_supplier_invoice
   Register an INCOMING invoice received FROM a supplier/vendor (leverandørfaktura, Lieferantenrechnung, facture fournisseur, factura de proveedor).
   DISTINCT from create_invoice: the money flows FROM us TO the supplier, not TO us.
   Use this when the prompt says: "received invoice from", "we got a bill from", "register supplier invoice", or uses supplier-specific terms.
-  Extract under customer: name (= the supplier name), org_number, email; set is_supplier=true.
+  Extract under customer: name (= the supplier name), org_number, email, address, postal_code, city; set is_supplier=true.
   Extract under invoice: invoice_number (external ref e.g. "INV-2026-3063"), amount (total incl VAT),
     amount_excl_vat (if stated), date (YYYY-MM-DD), vat_rate (default 25), account_code (GL account, e.g. 7300).
 
 register_payment
   Register a payment against an existing invoice.
   Extract under invoice: identifier (invoice number if numeric, else customer name).
-  Extract under payment: amount, date (default today).
+  Extract under payment: amount (in NOK), date (default today),
+    amount_currency (amount in the invoice's foreign currency, e.g. EUR amount),
+    currency (ISO code: "EUR", "USD", etc. — only if foreign currency),
+    exchange_rate_difference (NOK difference between booked rate and payment rate, if stated).
   Extract under customer: name (to find invoice by customer).
 
 create_credit_note
@@ -206,11 +214,19 @@ ledger_task
     - description: description of what is being posted
     - date (YYYY-MM-DD): accounting date for the entry (default today)
     - date_from, date_to: date range to search for vouchers to correct (for "correction")
-    - asset_cost: original asset cost (for depreciation)
-    - years: useful life in years (for depreciation; annual_amount = asset_cost / years)
-    - annual_amount: depreciation amount per year if directly stated
-    - depreciation_account: GL account number for depreciation expense (default "6010")
-    - accumulated_account: GL account number for accumulated depreciation (default "1209")
+    - assets: array of asset objects for depreciation/annual_close (ALWAYS use array, even for 1 asset):
+        each object: {{"name": "...", "cost": number, "years": number, "annual_amount": number or null,
+                       "asset_account": "NNNN", "depreciation_account": "NNNN", "accumulated_account": "NNNN"}}
+        asset_account: GL account where the asset is booked (e.g. "1200", "1240")
+        depreciation_account: expense account (default "6010")
+        accumulated_account: contra-asset account (default "1209")
+        Compute annual_amount = cost / years if not directly stated.
+    - prepaid_expenses: array of prepaid expense resolutions for annual_close:
+        each object: {{"amount": number, "from_account": "NNNN", "to_account": "NNNN", "description": "..."}}
+        from_account: prepaid/balance-sheet account (e.g. "1700")
+        to_account: expense account (e.g. "6300")
+    - tax_provision: tax provision for annual close (if profit info available):
+        {{"rate": 0.22, "expense_account": "8700", "payable_account": "2920"}}
     - dimension_name: name of the custom accounting dimension (for "custom_dimension")
       e.g. "Kostsenter", "Prosjektgruppe", "Region"
     - dimension_values: array of {{name, number}} for each value to create under the dimension

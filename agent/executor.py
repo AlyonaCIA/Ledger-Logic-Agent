@@ -344,9 +344,10 @@ def _create_employee(intent: dict, client: TripletexClient) -> None:
     annual_salary = emp.get("annual_salary")
     work_percent = emp.get("work_percent")
     job_title = emp.get("job_title") or emp.get("title")
+    occupation_code = emp.get("occupation_code")
 
     # At a minimum we need an employment record ID to attach details
-    if employment_id and (annual_salary or work_percent or job_title):
+    if employment_id and (annual_salary or work_percent or job_title or occupation_code):
         details_payload: dict = {
             "employment": {"id": employment_id},
             "date": start_date,
@@ -359,8 +360,22 @@ def _create_employee(intent: dict, client: TripletexClient) -> None:
         if annual_salary:
             details_payload["annualSalary"] = float(annual_salary)
 
-        # Look up occupation code if job title given
-        if job_title:
+        # Look up occupation code — try explicit code first, then by job title
+        occ_resolved = False
+        if occupation_code:
+            try:
+                codes = client.get_list(
+                    "/employee/employment/occupationCode",
+                    params={"code": str(occupation_code), "count": 5},
+                )
+                if codes:
+                    details_payload["occupationCode"] = {"id": codes[0]["id"]}
+                    occ_resolved = True
+                    logger.info(f"Resolved occupationCode id={codes[0]['id']} for code={occupation_code}")
+            except Exception as exc:
+                logger.debug(f"Occupation code lookup by code failed: {exc}")
+
+        if not occ_resolved and job_title:
             try:
                 codes = client.get_list(
                     "/employee/employment/occupationCode",
@@ -898,15 +913,60 @@ def _register_payment(intent: dict, client: TripletexClient) -> None:
 
     # Correct Tripletex action endpoint: PUT /invoice/{id}/:payment with all params in query
     # (openapi.json: paymentDate, paymentTypeId, paidAmount are all required query params)
-    data = client.put(
+    payment_url = (
         f"/invoice/{invoice_id}/:payment"
         f"?paymentDate={pay_date}"
         f"&paymentTypeId={payment_type_id}"
         f"&paidAmount={amount}"
     )
+    # For foreign currency: paidAmountCurrency is the amount in the invoice's currency
+    amount_currency = pay_data.get("amount_currency")
+    if amount_currency:
+        payment_url += f"&paidAmountCurrency={amount_currency}"
+
+    data = client.put(payment_url)
     result = (data or {}).get("value")
     if result:
         logger.info(f"Registered payment on invoice id={invoice_id}")
+
+    # ── Post exchange rate difference (agio) voucher if applicable ──
+    exchange_diff = pay_data.get("exchange_rate_difference")
+    if exchange_diff:
+        diff_amount = float(exchange_diff)
+        if abs(diff_amount) > 0.01:
+            # Positive diff = loss (we paid more NOK), negative = gain
+            if diff_amount > 0:
+                agio_acct_num, agio_name = "8160", "Valutakurstap"
+            else:
+                agio_acct_num, agio_name = "8060", "Valutakursgevinst"
+                diff_amount = -diff_amount  # make positive for the debit
+
+            agio_acct = None
+            recv_acct = None
+            for num in (agio_acct_num,):
+                results = client.get_list("/ledger/account", params={"number": num, "count": 5})
+                if results:
+                    agio_acct = results[0]
+                    break
+            for num in ("1500", "1501"):
+                results = client.get_list("/ledger/account", params={"number": num, "count": 5})
+                if results:
+                    recv_acct = results[0]
+                    break
+
+            if agio_acct and recv_acct:
+                try:
+                    v = _post_value_with_heal(client, "/ledger/voucher", {
+                        "date": pay_date,
+                        "description": f"Valutakursdifferanse – {agio_name}",
+                        "postings": [
+                            {"row": 1, "account": {"id": agio_acct["id"]}, "amountGross": diff_amount, "amountGrossCurrency": diff_amount},
+                            {"row": 2, "account": {"id": recv_acct["id"]}, "amountGross": -diff_amount, "amountGrossCurrency": -diff_amount},
+                        ],
+                    })
+                    logger.info(f"Posted agio voucher id={v.get('id') if v else None} diff={diff_amount}")
+                except Exception as exc:
+                    logger.error(f"Agio voucher failed: {exc}")
 
 
 # ======================================================================
@@ -1064,17 +1124,40 @@ def _create_supplier_invoice(intent: dict, client: TripletexClient) -> None:
         supp_payload: dict = {"name": supp["name"]}
         if org_number:
             supp_payload["organizationNumber"] = org_number
+        if supp.get("email"):
+            supp_payload["email"] = supp["email"]
+        if supp.get("phone"):
+            supp_payload["phoneNumber"] = supp["phone"]
+        # Add address if available
+        addr_parts: dict = {}
+        if supp.get("address"):
+            addr_parts["addressLine1"] = supp["address"]
+        if supp.get("postal_code"):
+            addr_parts["postalCode"] = supp["postal_code"]
+        if supp.get("city"):
+            addr_parts["city"] = supp["city"]
+        if addr_parts:
+            supp_payload["physicalAddress"] = addr_parts
         try:
             supplier = _post_value_with_heal(client, "/supplier", supp_payload)
             logger.info(f"Created supplier id={supplier.get('id') if supplier else None}")
         except requests.exceptions.HTTPError as exc:
-            if exc.response is not None and exc.response.status_code == 409:
-                results = client.get_list("/supplier", params={"count": 100})
-                name_lower = supp["name"].lower()
-                supplier = next(
-                    (s for s in results if name_lower in (s.get("name") or "").lower()),
-                    None,
-                )
+            if exc.response is not None and exc.response.status_code in (409, 422):
+                if exc.response.status_code == 422 and "physicalAddress" in supp_payload:
+                    # Retry without address (some setups reject it)
+                    supp_payload.pop("physicalAddress", None)
+                    try:
+                        supplier = _post_value_with_heal(client, "/supplier", supp_payload)
+                        logger.info(f"Created supplier (no address) id={supplier.get('id') if supplier else None}")
+                    except Exception:
+                        pass
+                if not supplier:
+                    results = client.get_list("/supplier", params={"count": 100})
+                    name_lower = supp["name"].lower()
+                    supplier = next(
+                        (s for s in results if name_lower in (s.get("name") or "").lower()),
+                        None,
+                    )
             else:
                 raise
 
@@ -2182,39 +2265,109 @@ def _ledger_task(intent: dict, client: TripletexClient) -> None:
                     logger.error(f"Corrected voucher posting failed: {exc}")
 
     elif subtask in ("depreciation", "monthly_close", "annual_close"):
-        # Post depreciation / close entries
-        # Parser may provide depreciation info at top level OR in a "depreciation" sub-object
-        depr_obj = ledger.get("depreciation") or {}
-        asset_cost = float(depr_obj.get("asset_cost") or ledger.get("asset_cost") or 0)
-        years = int(depr_obj.get("years") or ledger.get("years") or 1)
-        annual_amount = float(depr_obj.get("annual_amount") or ledger.get("annual_amount") or 0)
-        if asset_cost and years and not annual_amount:
-            annual_amount = round(asset_cost / years, 2)
-
-        depr_acct_num = str(depr_obj.get("depreciation_account") or ledger.get("depreciation_account") or "6010")
-        accum_acct_num = str(depr_obj.get("accumulated_account") or ledger.get("accumulated_account") or "1209")
         entry_date = ledger.get("date") or TODAY
+        is_monthly = subtask == "monthly_close"
 
-        # ── Post depreciation voucher if we have an amount ──
-        if annual_amount:
-            depr_acct = _find_or_create_account(depr_acct_num, "Avskrivning anleggsmidler")
-            accum_acct = _find_or_create_account(accum_acct_num, "Akkumulerte avskrivninger")
+        # ── Build assets list (multi-asset or legacy single-asset) ──
+        assets = ledger.get("assets") or []
+        if not assets:
+            # Backward compat: single-asset fields
+            depr_obj = ledger.get("depreciation") or {}
+            cost = float(depr_obj.get("asset_cost") or ledger.get("asset_cost") or 0)
+            yrs = int(depr_obj.get("years") or ledger.get("years") or 1)
+            amt = float(depr_obj.get("annual_amount") or ledger.get("annual_amount") or 0)
+            if cost and yrs and not amt:
+                amt = round(cost / yrs, 2)
+            if amt:
+                assets = [{
+                    "name": "Asset",
+                    "cost": cost,
+                    "years": yrs,
+                    "annual_amount": amt,
+                    "depreciation_account": str(depr_obj.get("depreciation_account") or ledger.get("depreciation_account") or "6010"),
+                    "accumulated_account": str(depr_obj.get("accumulated_account") or ledger.get("accumulated_account") or "1209"),
+                }]
+
+        # ── Post one depreciation voucher per asset ──
+        for asset in assets:
+            cost = float(asset.get("cost") or 0)
+            yrs = int(asset.get("years") or 1)
+            amt = float(asset.get("annual_amount") or 0)
+            if cost and yrs and not amt:
+                amt = round(cost / yrs, 2)
+            if is_monthly and amt:
+                amt = round(amt / 12, 2)
+            if not amt:
+                continue
+
+            depr_num = str(asset.get("depreciation_account") or "6010")
+            accum_num = str(asset.get("accumulated_account") or "1209")
+            asset_name = asset.get("name") or "Asset"
+
+            depr_acct = _find_or_create_account(depr_num, "Avskrivning")
+            accum_acct = _find_or_create_account(accum_num, "Akkumulerte avskrivninger")
 
             if depr_acct and accum_acct:
+                desc = f"Avskrivning – {asset_name}" if len(assets) > 1 else (ledger.get("description") or "Avskrivning")
                 try:
                     v = _post_value_with_heal(client, "/ledger/voucher", {
                         "date": entry_date,
-                        "description": ledger.get("description") or "Avskrivning",
+                        "description": desc,
                         "postings": [
-                            {"row": 1, "account": {"id": depr_acct["id"]}, "amountGross": annual_amount, "amountGrossCurrency": annual_amount},
-                            {"row": 2, "account": {"id": accum_acct["id"]}, "amountGross": -annual_amount, "amountGrossCurrency": -annual_amount},
+                            {"row": 1, "account": {"id": depr_acct["id"]}, "amountGross": amt, "amountGrossCurrency": amt},
+                            {"row": 2, "account": {"id": accum_acct["id"]}, "amountGross": -amt, "amountGrossCurrency": -amt},
                         ],
                     })
-                    logger.info(f"Posted depreciation voucher id={v.get('id') if v else None} amount={annual_amount}")
+                    logger.info(f"Posted depreciation voucher for {asset_name} id={v.get('id') if v else None} amount={amt}")
                 except Exception as exc:
-                    logger.error(f"Depreciation voucher failed: {exc}")
+                    logger.error(f"Depreciation voucher for {asset_name} failed: {exc}")
             else:
-                logger.error(f"Cannot find depreciation accounts ({depr_acct_num}, {accum_acct_num})")
+                logger.error(f"Cannot find accounts for {asset_name} ({depr_num}, {accum_num})")
+
+        # ── Post prepaid expense resolution vouchers ──
+        prepaid_list = ledger.get("prepaid_expenses") or []
+        for pe in prepaid_list:
+            pe_amount = float(pe.get("amount") or 0)
+            if not pe_amount:
+                continue
+            from_acct = _find_or_create_account(str(pe.get("from_account") or "1700"), "Forskuddsbetalt kostnad")
+            to_acct = _find_or_create_account(str(pe.get("to_account") or "6300"), "Leie-/leasingkostnad")
+            if from_acct and to_acct:
+                try:
+                    v = _post_value_with_heal(client, "/ledger/voucher", {
+                        "date": entry_date,
+                        "description": pe.get("description") or "Oppløsning forskuddsbetalt kostnad",
+                        "postings": [
+                            {"row": 1, "account": {"id": to_acct["id"]}, "amountGross": pe_amount, "amountGrossCurrency": pe_amount},
+                            {"row": 2, "account": {"id": from_acct["id"]}, "amountGross": -pe_amount, "amountGrossCurrency": -pe_amount},
+                        ],
+                    })
+                    logger.info(f"Posted prepaid expense voucher id={v.get('id') if v else None} amount={pe_amount}")
+                except Exception as exc:
+                    logger.error(f"Prepaid expense voucher failed: {exc}")
+
+        # ── Post tax provision voucher ──
+        tax_prov = ledger.get("tax_provision")
+        if tax_prov:
+            tax_amount = float(tax_prov.get("amount") or 0)
+            tax_rate = float(tax_prov.get("rate") or 0.22)
+            # If amount not given but rate is, we can't compute without profit info
+            if tax_amount:
+                exp_acct = _find_or_create_account(str(tax_prov.get("expense_account") or "8700"), "Skattekostnad")
+                pay_acct = _find_or_create_account(str(tax_prov.get("payable_account") or "2920"), "Betalbar skatt")
+                if exp_acct and pay_acct:
+                    try:
+                        v = _post_value_with_heal(client, "/ledger/voucher", {
+                            "date": entry_date,
+                            "description": f"Skatteavsetning ({int(tax_rate*100)}%)",
+                            "postings": [
+                                {"row": 1, "account": {"id": exp_acct["id"]}, "amountGross": tax_amount, "amountGrossCurrency": tax_amount},
+                                {"row": 2, "account": {"id": pay_acct["id"]}, "amountGross": -tax_amount, "amountGrossCurrency": -tax_amount},
+                            ],
+                        })
+                        logger.info(f"Posted tax provision voucher id={v.get('id') if v else None} amount={tax_amount}")
+                    except Exception as exc:
+                        logger.error(f"Tax provision voucher failed: {exc}")
 
         # ── Post remaining generic postings (accrual reversal, salary, etc.) ──
         postings_raw = ledger.get("postings") or []
