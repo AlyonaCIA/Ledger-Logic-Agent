@@ -93,16 +93,40 @@ async def solve(
 
     from agent.client import TripletexClient
     from agent.executor import execute_task
-    from agent.models import SolveRequest
+    from agent.models import SolveRequest, TripletexCredentials, FileAttachment
     from agent.parser import parse_task
 
     request_id = str(uuid.uuid4())[:8]
 
     try:
         req = SolveRequest(**body)
-    except Exception as exc:
-        logger.error(f"[{request_id}] Request validation error: {exc}")
-        return JSONResponse({"status": "completed"})
+    except Exception:
+        # Competition may send flat or differently-named fields — try to adapt
+        try:
+            prompt = body.get("prompt") or body.get("task") or body.get("message") or ""
+            creds = body.get("tripletex_credentials") or {}
+            base_url = (
+                creds.get("base_url") if isinstance(creds, dict) else None
+            ) or body.get("base_url") or body.get("service_url") or ""
+            session_token = (
+                creds.get("session_token") if isinstance(creds, dict) else None
+            ) or body.get("session_token") or body.get("token") or ""
+            raw_files = body.get("files") or []
+            files = []
+            for f in raw_files:
+                if isinstance(f, dict) and f.get("filename") and f.get("content_base64"):
+                    files.append(FileAttachment(**f))
+            req = SolveRequest(
+                prompt=prompt,
+                files=files,
+                tripletex_credentials=TripletexCredentials(
+                    base_url=base_url, session_token=session_token,
+                ),
+            )
+            logger.info(f"[{request_id}] Adapted request from non-standard body")
+        except Exception as exc2:
+            logger.error(f"[{request_id}] Request validation error: {exc2}")
+            return JSONResponse({"status": "completed"})
 
     logger.info(f"[{request_id}] PROMPT ({len(req.prompt)}c): {req.prompt[:300]}")
     logger.info(f"[{request_id}] FILES: {[f.filename for f in req.files]}")

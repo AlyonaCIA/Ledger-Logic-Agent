@@ -1508,9 +1508,16 @@ def _create_project(intent: dict, client: TripletexClient) -> None:
         except Exception:
             customer = _find_customer(client, cust_data["name"])
 
-    # Skip employee lookup — fresh accounts have no employees and Tripletex
-    # accepts projects without an explicit projectManager.
-    manager = None
+    # ── Resolve projectManager — required by Tripletex ──────────────
+    # Lowest-ID employee is the original admin; try each until project creation succeeds.
+    pm_candidates: list[int] = []
+    try:
+        all_emps = client.get_list("/employee", params={"count": 100, "fields": "id"})
+        if all_emps:
+            all_emps.sort(key=lambda e: e.get("id", float("inf")))
+            pm_candidates = [e["id"] for e in all_emps]
+    except Exception:
+        pass
 
     start_date = proj.get("start_date") or TODAY
 
@@ -1526,10 +1533,34 @@ def _create_project(intent: dict, client: TripletexClient) -> None:
         payload["description"] = proj["description"]
     if customer:
         payload["customer"] = {"id": customer["id"]}
-    if manager:
-        payload["projectManager"] = {"id": manager["id"]}
 
-    result = client.post_value("/project", json=payload)
+    result = None
+    for pm_id in (pm_candidates or [None]):  # type: ignore[list-item]
+        proj_payload = dict(payload)
+        if pm_id:
+            proj_payload["projectManager"] = {"id": pm_id}
+        try:
+            resp = client.post("/project", json=proj_payload)
+            val = resp.get("value") if isinstance(resp, dict) else None
+            if val and val.get("id"):
+                result = val
+                break
+        except requests.exceptions.HTTPError as exc:
+            err_body = exc.response.text if exc.response is not None else ""
+            if "projectManager" in err_body or "Prosjektleder" in err_body:
+                continue  # try next PM candidate
+            try:
+                result = _post_value_with_heal(client, "/project", proj_payload)
+            except Exception:
+                pass
+            break
+        except Exception:
+            try:
+                result = _post_value_with_heal(client, "/project", proj_payload)
+            except Exception:
+                pass
+            break
+
     if result:
         logger.info(f"Created project id={result.get('id')}")
 
@@ -1644,6 +1675,9 @@ def _run_payroll(intent: dict, client: TripletexClient) -> None:
             emp_payload["email"] = email
         if dept_id:
             emp_payload["department"] = {"id": dept_id}
+        # dateOfBirth is required for employment creation
+        dob = emp_data.get("date_of_birth") or "1990-01-01"
+        emp_payload["dateOfBirth"] = dob
         try:
             employee = _post_value_with_heal(client, "/employee", emp_payload)
             if employee:
@@ -1665,11 +1699,19 @@ def _run_payroll(intent: dict, client: TripletexClient) -> None:
 
         if not has_employment:
             try:
-                client.post("/employee/employment", json={
+                empl_payload: dict = {
                     "employee": {"id": employee["id"]},
                     "startDate": TODAY,
                     "isMainEmployer": True,
-                })
+                }
+                # Tripletex requires dateOfBirth on the employee before creating employment.
+                # Ensure it's set (may have been skipped on employee creation).
+                dob = emp_data.get("date_of_birth") or "1990-01-01"
+                try:
+                    client.put(f"/employee/{employee['id']}", json={"dateOfBirth": dob})
+                except Exception:
+                    pass
+                client.post("/employee/employment", json=empl_payload)
                 logger.info(f"Created employment for employee id={employee['id']}")
             except Exception as exc:
                 logger.warning(f"Employment creation failed: {exc}")
@@ -2245,7 +2287,7 @@ def _ledger_task(intent: dict, client: TripletexClient) -> None:
 
         if target_voucher:
             try:
-                client.put_value(
+                client.put(
                     f"/ledger/voucher/{target_voucher['id']}/:reverse",
                     params={"date": TODAY},
                 )
