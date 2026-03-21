@@ -55,7 +55,14 @@ def validate_intent(intent: dict) -> dict:
 
     required = _REQUIRED.get(task_type, [])
     for (section, field) in required:
-        if not (intent.get(section) or {}).get(field):
+        section_val = intent.get(section)
+        # department may be a list (multiple departments) or a single dict
+        if isinstance(section_val, list):
+            if not (section_val and section_val[0].get(field)):
+                raise ValidationError(
+                    f"task_type={task_type!r} requires {section}.{field}"
+                )
+        elif not (section_val or {}).get(field):
             raise ValidationError(
                 f"task_type={task_type!r} requires {section}.{field}"
             )

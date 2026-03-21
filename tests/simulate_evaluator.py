@@ -341,7 +341,7 @@ def make_tasks(ts: str) -> list[tuple[str, str, object]]:
     dept_name_en = f"Engineering-{ts}X"
 
     def verify_department(result, name):
-        depts = tx_get_list("/department", {"count": 50})
+        depts = tx_get_list("/department", {"count": 500})
         found = next((d for d in depts if d.get("name") == name), None)
         result.check("department exists", found is not None, f"name={name!r}")
         if found:

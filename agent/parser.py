@@ -58,6 +58,12 @@ TASK TYPES
 create_employee
   Create a new employee. Extract:
   - first_name, last_name, email, phone
+  - start_date (YYYY-MM-DD): employment start date if mentioned
+  - annual_salary: yearly salary in NOK if mentioned (e.g. "660 000 kr/år" → 660000)
+  - work_percent: percentage of full-time employment if mentioned (e.g. "80 %" → 80)
+  - job_title: job title / occupation (e.g. "Regnskapssjef", "Software Engineer")
+  - date_of_birth (YYYY-MM-DD): birth date if mentioned
+  - national_id_number: national ID / personnummer if mentioned
   - is_account_admin: TRUE if role is any of:
     nb: kontoadministrator, kontoadmin
     en: account administrator, account admin
@@ -93,6 +99,20 @@ create_invoice
   Extract order_lines: each line has description, count, unit_price_excl_vat.
   If a single amount is given with no line detail, make one line with that amount.
   ALSO MATCHES (multilingual): "commande" / "bon de commande" (fr), "Rechnung" / "Bestellung" (de), "factura" / "pedido" (es), "fatura" (pt), "bestilling" (nb/nn).
+  NOTE: This is an OUTGOING invoice to a customer. For an INCOMING invoice from a supplier, use create_supplier_invoice instead.
+  COMBINED INVOICE+PAYMENT: If the prompt ALSO asks to register payment after creating the invoice
+  (nb: "registrer full betaling" / "registrer betaling", en: "register full payment" / "register payment",
+   es: "registrar pago total", pt: "registre o pagamento", de: "zahlung registrieren", fr: "enregistrer le paiement"),
+  ALSO extract under payment: {{amount: <total from order_lines or stated total>, date: today}}.
+  This triggers automatic payment registration after invoice creation.
+
+create_supplier_invoice
+  Register an INCOMING invoice received FROM a supplier/vendor (leverandørfaktura, Lieferantenrechnung, facture fournisseur, factura de proveedor).
+  DISTINCT from create_invoice: the money flows FROM us TO the supplier, not TO us.
+  Use this when the prompt says: "received invoice from", "we got a bill from", "register supplier invoice", or uses supplier-specific terms.
+  Extract under customer: name (= the supplier name), org_number, email; set is_supplier=true.
+  Extract under invoice: invoice_number (external ref e.g. "INV-2026-3063"), amount (total incl VAT),
+    amount_excl_vat (if stated), date (YYYY-MM-DD), vat_rate (default 25), account_code (GL account, e.g. 7300).
 
 register_payment
   Register a payment against an existing invoice.
@@ -107,9 +127,49 @@ create_credit_note
 
 create_travel_expense
   Create a travel expense report for an employee.
-  Extract under employee: identifier (name to find them).
-  Extract under travel_expense: description, from_date (YYYY-MM-DD), to_date (YYYY-MM-DD), amount, is_foreign_travel.
-  NOTE: do NOT use this for payroll/salary tasks — those are "unknown".
+  Extract under employee: identifier (name to find them), email if given.
+  Extract under travel_expense:
+    - description: trip title/purpose
+    - destination: destination city or country (e.g. "Bergen", "Oslo", "Paris")
+    - from_date (YYYY-MM-DD): departure date if mentioned
+    - to_date (YYYY-MM-DD): return date if mentioned
+    - is_foreign_travel: true if international/foreign travel
+    - per_diem_days: number of days (e.g. "5 days" → 5)
+    - per_diem_rate: daily allowance rate in NOK/day if mentioned
+    - costs: array of individual expenses, each with:
+        type: one of "flight", "taxi", "hotel", "bus", "ferry", "train", "food", "parking", "other"
+        amount: amount in NOK
+        description: brief label (original language ok)
+  Example for FR: "billet d'avion 3850 NOK et taxi 650 NOK" →
+    costs: [{{"type":"flight","amount":3850,"description":"Billet d'avion"}},{{"type":"taxi","amount":650,"description":"Taxi"}}]
+  NOTE: do NOT use this for payroll/salary tasks — use run_payroll instead.
+
+run_payroll
+  Record payroll/salary for an employee via the salary API.
+  Use this for ALL payroll/salary processing tasks in ANY language:
+    en: "run payroll", "process payroll", "process salary"
+    nb/nn: "kjør lønn", "lønn", "lønning", "utbetal lønn"
+    de: "Gehaltsabrechnung", "Lohnabrechnung", "Gehalt auszahlen", "führen Sie die Gehaltsabrechnung"
+    es: "nómina", "ejecute la nómina", "procesar nómina"
+    fr: "salaire", "fiche de paie", "traiter la paie", "effectuer la paie"
+    pt: "folha de pagamento", "processar salário"
+  Extract under employee: first_name, last_name, email, identifier (full name).
+  Extract under payroll: base_salary (number, required), bonus (number, 0 if none),
+    year (current year if not stated), month (current month if not stated).
+
+create_project_invoice
+  Register hours worked on a project for an employee, then generate a project invoice.
+  Use when the prompt asks to BOTH register hours AND generate a project invoice:
+    es: "Registre X horas...en la actividad...del proyecto...Genere una factura de proyecto"
+    fr: "Enregistrez X heures...sur l'activité...du projet...Générez une facture de projet"
+    en: "Register X hours...on activity...of project...generate a project invoice"
+    nb: "Registrer X timer...på aktiviteten...for prosjektet...generer prosjektfaktura"
+    de: "X Stunden erfassen...auf Aktivität...des Projekts...Projektrechnung erstellen"
+    pt: "Registre X horas...na atividade...do projeto...gere uma fatura de projeto"
+  Extract under employee: identifier (full name), email (if present), first_name, last_name.
+  Extract under project: name (project name), activity (activity name, e.g. "Design").
+  Extract under customer: name, org_number (if present).
+  Extract under invoice: hours (number of hours), hourly_rate (rate per hour in NOK), date (today if not given).
 
 delete_travel_expense
   Delete a travel expense report.
@@ -124,7 +184,7 @@ create_project
 create_department
   Create one or more departments.
   If the prompt asks to create MULTIPLE departments, output "department" as a JSON array.
-  Each element: {"name": "...", "department_number": null}.
+  Each element: {{"name": "...", "department_number": null}}.
   If only one department, output "department" as a single object (not an array).
   department_number: only if an explicit numeric code/ID is given separately from the name.
 
@@ -136,16 +196,78 @@ delete_voucher
   Delete / reverse an incorrect ledger entry or voucher.
   Put any identifying info in notes.
 
+ledger_task
+  Post complex ledger entries: corrections, depreciation, monthly/annual close.
+  Use when the task involves reversing wrong vouchers, posting depreciation entries,
+  or doing period-end accounting close.
+  Extract under ledger:
+    - subtask: one of "correction", "depreciation", "monthly_close", "annual_close", "voucher"
+    - description: description of what is being posted
+    - date (YYYY-MM-DD): accounting date for the entry (default today)
+    - date_from, date_to: date range to search for vouchers to correct (for "correction")
+    - asset_cost: original asset cost (for depreciation)
+    - years: useful life in years (for depreciation; annual_amount = asset_cost / years)
+    - annual_amount: depreciation amount per year if directly stated
+    - depreciation_account: GL account number for depreciation expense (default "6010")
+    - accumulated_account: GL account number for accumulated depreciation (default "1209")
+    - postings: array of {{account_number, account_name (optional), amount}} for generic entries
+
 NOT SUPPORTED — use task_type "unknown" for:
-  - Payroll / salary calculation:
-    en: run payroll, salary
-    nb/nn: kjør lønn, lønning, lønn
-    de: Gehaltsabrechnung, Lohnabrechnung, Gehalt auszahlen
-    es: nómina, ejecute la nómina
-    fr: salaire, fiche de paie
-    pt: folha de pagamento
-  - Free accounting dimensions / free dimensions ("fri regnskapsdimensjon", "dimensión contable")
+  - Free accounting dimensions / free dimensions ("fri regnskapsdimensjon", "dimensión contable libre")
   - Any task not listed above
+
+══════════════════════════════════════════════
+MULTILINGUAL TERM → TRIPLETEX ENDPOINT CHEATSHEET
+══════════════════════════════════════════════
+Use this table to map foreign-language accounting terms directly to the
+correct task_type without any ambiguity:
+
+  nb: Faktura / Ordre     → create_invoice   (/invoice)
+  en: Invoice / Order     → create_invoice   (/invoice)
+  es: Factura / Pedido    → create_invoice   (/invoice)
+  pt: Fatura              → create_invoice   (/invoice)
+  de: Rechnung / Bestellung → create_invoice (/invoice)
+  fr: Facture / Commande / Bon de commande → create_invoice (/invoice)
+
+  nb: Leverandørfaktura   → create_supplier_invoice (/ledger/voucher with vendorInvoiceNumber)
+  en: Supplier invoice / Vendor invoice → create_supplier_invoice (/ledger/voucher with vendorInvoiceNumber)
+  de: Lieferantenrechnung → create_supplier_invoice (/ledger/voucher with vendorInvoiceNumber)
+  fr: Facture fournisseur → create_supplier_invoice (/ledger/voucher with vendorInvoiceNumber)
+  es: Factura de proveedor → create_supplier_invoice (/ledger/voucher with vendorInvoiceNumber)
+  pt: Fatura de fornecedor → create_supplier_invoice (/ledger/voucher with vendorInvoiceNumber)
+
+  nb: Ansatt / Medarbeider → create_employee  (/employee)
+  en: Employee / Staff     → create_employee  (/employee)
+  es: Empleado             → create_employee  (/employee)
+  pt: Funcionário / Empregado → create_employee (/employee)
+  de: Mitarbeiter / Angestellter → create_employee (/employee)
+  fr: Employé / Collaborateur → create_employee (/employee)
+
+  nb: Kunde / Klient       → create_customer  (/customer)
+  en: Customer / Client    → create_customer  (/customer)
+  es: Cliente              → create_customer  (/customer)
+  pt: Cliente              → create_customer  (/customer)
+  de: Kunde / Klient       → create_customer  (/customer)
+  fr: Client               → create_customer  (/customer)
+
+  nb: Reise / Utlegg       → create_travel_expense (/travelExpense)
+  de: Dienstreise / Reisekosten → create_travel_expense (/travelExpense)
+  fr: Note de frais / Voyage → create_travel_expense (/travelExpense)
+  es: Gasto de viaje       → create_travel_expense (/travelExpense)
+
+  en: run payroll / salary / payroll         → run_payroll
+  nb: kjør lønn / lønning / lønn             → run_payroll
+  de: Gehaltsabrechnung / Lohnabrechnung     → run_payroll
+  es: nómina / ejecute la nómina             → run_payroll
+  fr: salaire / fiche de paie / traiter la paie → run_payroll
+  pt: folha de pagamento / processar salário → run_payroll
+
+  en: project invoice / register hours       → create_project_invoice
+  es: factura de proyecto / registre horas   → create_project_invoice
+  fr: facture de projet / enregistrez heures → create_project_invoice
+  nb: prosjektfaktura / registrer timer      → create_project_invoice
+  de: Projektrechnung / Stunden erfassen     → create_project_invoice
+  pt: fatura de projeto / registre horas     → create_project_invoice
 
 ══════════════════════════════════════════════
 DATES
@@ -197,13 +319,13 @@ Optional entity keys (include only if relevant): employee, customer, product, in
 Set entity field values to null when not present in the prompt. Never invent data.
 
 Example output:
-{
+{{
   "task_type": "create_customer",
   "confidence": 0.98,
   "language_detected": "nb",
   "missing_fields": [],
-  "customer": {"name": "Acme AS", "email": "post@acme.no", "phone": null, "org_number": null, "is_supplier": null, "identifier": null}
-}
+  "customer": {{"name": "Acme AS", "email": "post@acme.no", "phone": null, "org_number": null, "is_supplier": null, "identifier": null}}
+}}
 """
 
 # ------------------------------------------------------------------ #
@@ -213,7 +335,8 @@ Example output:
 def _extract_json(text: str) -> dict[str, Any]:
     """
     Extract and parse a JSON object from model output.
-    Handles markdown code fences and stray leading/trailing text.
+    Handles markdown code fences, stray leading/trailing text, and arrays.
+    When the model returns a JSON array, the first element is used.
     """
     text = text.strip()
     # Strip ```json ... ``` or ``` ... ```
@@ -221,11 +344,40 @@ def _extract_json(text: str) -> dict[str, Any]:
         lines = text.splitlines()
         inner = [l for l in lines if not l.startswith("```")]
         text = "\n".join(inner).strip()
-    # Find first { and last }
+
+    # Fast path: try the full text as-is (handles both {} and [{...}] responses)
+    try:
+        result = json.loads(text)
+        if isinstance(result, list) and result and isinstance(result[0], dict):
+            return result[0]
+        if isinstance(result, dict):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: find first { ... } block and parse it
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
-        text = text[start : end + 1]
+        try:
+            return json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            pass
+
+    # Last resort: scan for balanced braces to find the first complete object
+    depth = 0
+    obj_start = -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                obj_start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and obj_start != -1:
+                return json.loads(text[obj_start : i + 1])
+
+    # Nothing worked — let json.loads raise its own error
     return json.loads(text)
 
 
@@ -325,7 +477,13 @@ def _parse_task_sync(prompt: str, files: list[FileAttachment]) -> dict[str, Any]
         config=types.GenerateContentConfig(
             system_instruction=system_prompt,
             temperature=0,
-            max_output_tokens=1024,
+            # Increase tokens — complex multi-product invoices need space for full JSON
+            max_output_tokens=4096,
+            # Force valid JSON output: prevents markdown fences and truncated strings
+            response_mime_type="application/json",
+            # Disable automatic function calling — it is ON by default in genai 1.68+
+            # and adds latency / can interfere with plain text generation
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         ),
     )
 

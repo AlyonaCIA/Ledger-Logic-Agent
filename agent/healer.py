@@ -68,7 +68,10 @@ def heal_payload(
             contents=prompt,
             config=gtypes.GenerateContentConfig(
                 temperature=0,
-                max_output_tokens=512,
+                max_output_tokens=2048,
+                # Force valid JSON — prevents truncated/markdown-wrapped responses
+                response_mime_type="application/json",
+                automatic_function_calling=gtypes.AutomaticFunctionCallingConfig(disable=True),
             ),
         )
         healed = _extract_json(response.text)

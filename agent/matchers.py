@@ -118,7 +118,7 @@ def resolve_customer(
 
     results = client.get_list(
         "/customer",
-        params={"name": name or "", "count": 500},
+        params={"name": name or "", "count": 500, "fields": "id,name,email,organizationNumber"},
     )
 
     # 1. Exact normalized name
@@ -205,7 +205,7 @@ def resolve_department(
     """Resolve a department by exact name."""
     if not name:
         return None
-    depts = client.get_list("/department", params={"count": 500})
+    depts = client.get_list("/department", params={"count": 500, "fields": "id,name"})
     n = _normalize(name)
     for d in depts:
         if _normalize(d.get("name")) == n:
@@ -229,6 +229,7 @@ def resolve_invoice(
         "invoiceDateFrom": date_from,
         "invoiceDateTo": date_to,
         "count": 100,
+        "fields": "id,invoiceNumber,amountOutstanding,amountCurrency,customer",
     }
     if customer_id:
         params["customerId"] = customer_id
