@@ -117,6 +117,8 @@ def execute_task(intent: dict[str, Any], client: TripletexClient) -> None:
         "run_payroll": _run_payroll,
         "create_project_invoice": _create_project_invoice,
         "ledger_task": _ledger_task,
+        "bank_reconciliation": _bank_reconciliation,
+        "overdue_reminder": _overdue_reminder,
     }
 
     fn = handlers.get(task_type)
@@ -134,6 +136,15 @@ def execute_task(intent: dict[str, Any], client: TripletexClient) -> None:
 # ======================================================================
 
 _KEYWORD_MAP: list[tuple[list[str], str]] = [
+    # Bank reconciliation MUST come before payment to avoid wrong routing
+    (["bank reconciliation", "reconcile bank", "bank statement", "bankutskrift",
+      "avstemming", "avstemme", "kontoauszug", "relevé bancaire",
+      "extracto bancario", "extrato bancário"], "bank_reconciliation"),
+    # Overdue / reminder fee MUST come before generic invoice
+    (["overdue invoice", "reminder fee", "purregebyr", "forfalt faktura", "purring",
+      "mahngebühr", "überfällig", "frais de rappel", "facture en retard",
+      "cargo por mora", "factura vencida", "taxa de lembrete", "fatura vencida",
+      "inkassogebyr"], "overdue_reminder"),
     # Supplier invoice MUST come before generic invoice to avoid wrong routing
     (["supplier invoice", "vendor invoice", "leverandørfaktura", "lieferantenrechnung",
       "facture fournisseur", "factura de proveedor", "fatura de fornecedor", "leverandør"], "create_supplier_invoice"),
@@ -366,12 +377,15 @@ def _create_employee(intent: dict, client: TripletexClient) -> None:
             try:
                 codes = client.get_list(
                     "/employee/employment/occupationCode",
-                    params={"code": str(occupation_code), "count": 5},
+                    params={"code": str(occupation_code), "count": 100},
                 )
                 if codes:
-                    details_payload["occupationCode"] = {"id": codes[0]["id"]}
+                    # API does prefix search — filter client-side for exact match
+                    exact = [c for c in codes if str(c.get("code", "")) == str(occupation_code)]
+                    match = exact[0] if exact else codes[0]
+                    details_payload["occupationCode"] = {"id": match["id"]}
                     occ_resolved = True
-                    logger.info(f"Resolved occupationCode id={codes[0]['id']} for code={occupation_code}")
+                    logger.info(f"Resolved occupationCode id={match['id']} code={match.get('code')} for requested={occupation_code}")
             except Exception as exc:
                 logger.debug(f"Occupation code lookup by code failed: {exc}")
 
@@ -2382,3 +2396,453 @@ def _ledger_task(intent: dict, client: TripletexClient) -> None:
             return
 
         _post_generic_ledger_postings(client, postings_raw, ledger.get("date") or TODAY, ledger.get("description") or "Ledger entry")
+
+
+# ======================================================================
+# Bank Reconciliation handler
+# ======================================================================
+
+def _bank_reconciliation(intent: dict, client: TripletexClient) -> None:
+    """Reconcile a bank statement (CSV) against invoices and suppliers."""
+    bs = intent.get("bank_statement") or {}
+    txns = bs.get("transactions") or []
+    if not txns:
+        logger.error("bank_reconciliation: no transactions extracted from statement")
+        return
+
+    _ensure_bank_account(client)
+    payment_type_id = _get_default_payment_type(client)
+    bank_acct = _resolve_account(client, "1920")
+
+    for i, txn in enumerate(txns):
+        txn_type = (txn.get("type") or "other").lower()
+        txn_date = txn.get("date") or TODAY
+        amount = txn.get("amount") or 0
+        counterparty = txn.get("counterparty") or ""
+        description = txn.get("description") or counterparty or txn_type
+        ref = txn.get("reference") or ""
+
+        if not amount:
+            continue
+
+        logger.info(f"Bank txn {i+1}/{len(txns)}: {txn_type} {amount} {counterparty!r} ref={ref!r}")
+
+        try:
+            if txn_type == "customer_payment":
+                _bank_process_customer_payment(
+                    client, counterparty, ref, abs(amount), txn_date, payment_type_id
+                )
+            elif txn_type == "supplier_payment":
+                _bank_process_supplier_payment(
+                    client, counterparty, ref, abs(amount), txn_date, bank_acct
+                )
+            elif txn_type in ("interest_income", "interest_expense"):
+                _bank_process_interest(client, txn_type, amount, txn_date, bank_acct, description)
+            elif txn_type == "tax":
+                _bank_process_tax(client, abs(amount), txn_date, bank_acct, description)
+            elif txn_type == "fee":
+                _bank_process_fee(client, abs(amount), txn_date, bank_acct, description)
+            else:
+                # Generic: post a voucher with bank account and a guess at the contra account
+                _bank_process_other(client, amount, txn_date, bank_acct, description)
+        except Exception as exc:
+            logger.error(f"Bank txn {i+1} failed: {exc}")
+
+
+def _resolve_account(client: TripletexClient, number: str) -> dict | None:
+    """Resolve a ledger account by number."""
+    try:
+        results = client.get_list("/ledger/account", params={"number": number, "count": 5})
+        return results[0] if results else None
+    except Exception:
+        return None
+
+
+def _bank_process_customer_payment(
+    client: TripletexClient,
+    customer_name: str,
+    invoice_ref: str,
+    amount: float,
+    pay_date: str,
+    payment_type_id: int | None,
+) -> None:
+    """Register payment on a customer invoice."""
+    customer = _find_customer(client, customer_name)
+    if not customer:
+        logger.warning(f"Bank recon: customer {customer_name!r} not found, skipping")
+        return
+
+    # Find invoice — by number if reference is numeric, else by customer
+    invoice = None
+    if invoice_ref and str(invoice_ref).isdigit():
+        invoice = resolve_invoice(client, customer_id=customer["id"], invoice_number=invoice_ref)
+    if not invoice:
+        invoice = resolve_invoice(client, customer_id=customer["id"])
+    if not invoice:
+        logger.warning(f"Bank recon: no invoice found for customer {customer_name!r}")
+        return
+
+    if not payment_type_id:
+        logger.error("Bank recon: no payment type available")
+        return
+
+    payment_url = (
+        f"/invoice/{invoice['id']}/:payment"
+        f"?paymentDate={pay_date}"
+        f"&paymentTypeId={payment_type_id}"
+        f"&paidAmount={amount}"
+    )
+    try:
+        client.put(payment_url)
+        logger.info(f"Bank recon: registered customer payment {amount} on invoice {invoice['id']}")
+    except Exception as exc:
+        logger.error(f"Bank recon: customer payment failed: {exc}")
+
+
+def _bank_process_supplier_payment(
+    client: TripletexClient,
+    supplier_name: str,
+    reference: str,
+    amount: float,
+    pay_date: str,
+    bank_acct: dict | None,
+) -> None:
+    """Post a supplier payment voucher (debit 2400, credit 1920)."""
+    # Find supplier
+    supplier = None
+    try:
+        results = client.get_list("/supplier", params={"count": 200})
+        name_lower = supplier_name.lower()
+        supplier = next(
+            (s for s in results if name_lower in (s.get("name") or "").lower()),
+            None,
+        )
+    except Exception:
+        pass
+
+    if not supplier:
+        logger.warning(f"Bank recon: supplier {supplier_name!r} not found, skipping")
+        return
+
+    ap_acct = _resolve_account(client, "2400")  # accounts payable
+    if not ap_acct or not bank_acct:
+        logger.error("Bank recon: missing AP (2400) or bank (1920) account")
+        return
+
+    desc = f"Betaling {supplier_name}"
+    if reference:
+        desc += f" ref {reference}"
+
+    try:
+        v = _post_value_with_heal(client, "/ledger/voucher", {
+            "date": pay_date,
+            "description": desc,
+            "postings": [
+                {
+                    "row": 1,
+                    "account": {"id": ap_acct["id"]},
+                    "amountGross": amount,
+                    "amountGrossCurrency": amount,
+                    "description": desc,
+                    "supplier": {"id": supplier["id"]},
+                },
+                {
+                    "row": 2,
+                    "account": {"id": bank_acct["id"]},
+                    "amountGross": -amount,
+                    "amountGrossCurrency": -amount,
+                    "description": desc,
+                },
+            ],
+        })
+        logger.info(f"Bank recon: posted supplier payment voucher id={v.get('id') if v else None}")
+    except Exception as exc:
+        logger.error(f"Bank recon: supplier payment voucher failed: {exc}")
+
+
+def _bank_process_interest(
+    client: TripletexClient,
+    txn_type: str,
+    amount: float,
+    pay_date: str,
+    bank_acct: dict | None,
+    description: str,
+) -> None:
+    """Post interest income or expense voucher."""
+    if txn_type == "interest_income":
+        contra_acct = _resolve_account(client, "8040")  # Interest income
+        bank_amount = abs(amount)
+        contra_amount = -abs(amount)
+    else:
+        contra_acct = _resolve_account(client, "8150")  # Interest expense
+        bank_amount = -abs(amount)
+        contra_amount = abs(amount)
+
+    if not contra_acct or not bank_acct:
+        logger.error("Bank recon: missing accounts for interest posting")
+        return
+
+    try:
+        v = _post_value_with_heal(client, "/ledger/voucher", {
+            "date": pay_date,
+            "description": description,
+            "postings": [
+                {"row": 1, "account": {"id": bank_acct["id"]}, "amountGross": bank_amount, "amountGrossCurrency": bank_amount, "description": description},
+                {"row": 2, "account": {"id": contra_acct["id"]}, "amountGross": contra_amount, "amountGrossCurrency": contra_amount, "description": description},
+            ],
+        })
+        logger.info(f"Bank recon: posted interest voucher id={v.get('id') if v else None}")
+    except Exception as exc:
+        logger.error(f"Bank recon: interest voucher failed: {exc}")
+
+
+def _bank_process_tax(
+    client: TripletexClient,
+    amount: float,
+    pay_date: str,
+    bank_acct: dict | None,
+    description: str,
+) -> None:
+    """Post tax deduction voucher (debit 1950 tax withholding, credit 1920 bank)."""
+    tax_acct = _resolve_account(client, "1950")  # Skattetrekk
+    if not tax_acct:
+        tax_acct = _resolve_account(client, "2600")  # Skyldig skattetrekk
+    if not tax_acct or not bank_acct:
+        logger.error("Bank recon: missing accounts for tax posting")
+        return
+
+    try:
+        v = _post_value_with_heal(client, "/ledger/voucher", {
+            "date": pay_date,
+            "description": description,
+            "postings": [
+                {"row": 1, "account": {"id": tax_acct["id"]}, "amountGross": amount, "amountGrossCurrency": amount, "description": description},
+                {"row": 2, "account": {"id": bank_acct["id"]}, "amountGross": -amount, "amountGrossCurrency": -amount, "description": description},
+            ],
+        })
+        logger.info(f"Bank recon: posted tax voucher id={v.get('id') if v else None}")
+    except Exception as exc:
+        logger.error(f"Bank recon: tax voucher failed: {exc}")
+
+
+def _bank_process_fee(
+    client: TripletexClient,
+    amount: float,
+    pay_date: str,
+    bank_acct: dict | None,
+    description: str,
+) -> None:
+    """Post bank fee voucher (debit 7770 bank charges, credit 1920 bank)."""
+    fee_acct = _resolve_account(client, "7770")  # Bankgebyr
+    if not fee_acct:
+        fee_acct = _resolve_account(client, "7700")
+    if not fee_acct or not bank_acct:
+        logger.error("Bank recon: missing accounts for fee posting")
+        return
+
+    try:
+        v = _post_value_with_heal(client, "/ledger/voucher", {
+            "date": pay_date,
+            "description": description,
+            "postings": [
+                {"row": 1, "account": {"id": fee_acct["id"]}, "amountGross": amount, "amountGrossCurrency": amount, "description": description},
+                {"row": 2, "account": {"id": bank_acct["id"]}, "amountGross": -amount, "amountGrossCurrency": -amount, "description": description},
+            ],
+        })
+        logger.info(f"Bank recon: posted fee voucher id={v.get('id') if v else None}")
+    except Exception as exc:
+        logger.error(f"Bank recon: fee voucher failed: {exc}")
+
+
+def _bank_process_other(
+    client: TripletexClient,
+    amount: float,
+    pay_date: str,
+    bank_acct: dict | None,
+    description: str,
+) -> None:
+    """Post a generic bank transaction voucher."""
+    if not bank_acct:
+        return
+    # Use a suspense/clearing account for unknown transactions
+    contra_acct = _resolve_account(client, "1999")  # Interim/suspense
+    if not contra_acct:
+        contra_acct = _resolve_account(client, "1900")
+    if not contra_acct:
+        return
+
+    try:
+        v = _post_value_with_heal(client, "/ledger/voucher", {
+            "date": pay_date,
+            "description": description,
+            "postings": [
+                {"row": 1, "account": {"id": bank_acct["id"]}, "amountGross": amount, "amountGrossCurrency": amount, "description": description},
+                {"row": 2, "account": {"id": contra_acct["id"]}, "amountGross": -amount, "amountGrossCurrency": -amount, "description": description},
+            ],
+        })
+        logger.info(f"Bank recon: posted generic voucher id={v.get('id') if v else None}")
+    except Exception as exc:
+        logger.error(f"Bank recon: generic voucher failed: {exc}")
+
+
+# ======================================================================
+# Overdue Invoice + Reminder handler
+# ======================================================================
+
+def _overdue_reminder(intent: dict, client: TripletexClient) -> None:
+    """Find an overdue invoice, post reminder fee voucher, create+send reminder invoice, register partial payment."""
+    reminder = intent.get("reminder") or {}
+    cust_data = intent.get("customer") or {}
+    fee_amount = reminder.get("fee_amount") or 70
+    debit_account_num = str(reminder.get("debit_account") or "1500")
+    credit_account_num = str(reminder.get("credit_account") or "3400")
+    partial_payment = reminder.get("partial_payment_amount")
+    send_invoice = reminder.get("send_invoice", True)
+
+    _ensure_bank_account(client)
+
+    # ── Find overdue invoice ──────────────────────────────────────────
+    # Search all invoices within past 2 years, find one past due
+    date_from = (date.today() - timedelta(days=365 * 2)).isoformat()
+    date_to = (date.today() + timedelta(days=365)).isoformat()
+
+    params: dict = {
+        "invoiceDateFrom": date_from,
+        "invoiceDateTo": date_to,
+        "count": 200,
+    }
+    # Filter by customer if specified
+    customer = None
+    if cust_data.get("name"):
+        customer = _find_customer(client, cust_data["name"])
+        if customer:
+            params["customerId"] = customer["id"]
+
+    try:
+        invoices = client.get_list("/invoice", params=params)
+    except Exception:
+        invoices = []
+
+    # Find the overdue one: invoiceDueDate < today and amountOutstanding > 0
+    today_str = date.today().isoformat()
+    overdue = None
+    for inv in invoices:
+        due_date = inv.get("invoiceDueDate") or ""
+        outstanding = inv.get("amountOutstanding") or 0
+        if due_date < today_str and outstanding > 0:
+            overdue = inv
+            break
+
+    # Fallback: any invoice with outstanding amount
+    if not overdue:
+        for inv in invoices:
+            if (inv.get("amountOutstanding") or 0) > 0:
+                overdue = inv
+                break
+
+    # Last resort: just pick the first invoice
+    if not overdue and invoices:
+        overdue = invoices[0]
+
+    if not overdue:
+        logger.error("overdue_reminder: no invoice found")
+        return
+
+    invoice_id = overdue["id"]
+    # Determine the customer from the invoice if not already known
+    if not customer:
+        inv_customer = overdue.get("customer") or {}
+        if inv_customer.get("id"):
+            customer = {"id": inv_customer["id"], "name": inv_customer.get("name", "")}
+
+    customer_id = customer["id"] if customer else None
+    logger.info(f"overdue_reminder: found overdue invoice id={invoice_id}, customer_id={customer_id}")
+
+    # ── Post reminder fee voucher ─────────────────────────────────────
+    debit_acct = _resolve_account(client, debit_account_num)
+    credit_acct = _resolve_account(client, credit_account_num)
+
+    if debit_acct and credit_acct:
+        postings = [
+            {
+                "row": 1,
+                "account": {"id": debit_acct["id"]},
+                "amountGross": fee_amount,
+                "amountGrossCurrency": fee_amount,
+                "description": "Purregebyr",
+            },
+            {
+                "row": 2,
+                "account": {"id": credit_acct["id"]},
+                "amountGross": -fee_amount,
+                "amountGrossCurrency": -fee_amount,
+                "description": "Purregebyr",
+            },
+        ]
+        # Add customer.id to 1500 posting (Tripletex requires it for AR postings)
+        if customer_id and debit_account_num in ("1500", "1501"):
+            postings[0]["customer"] = {"id": customer_id}
+
+        try:
+            v = _post_value_with_heal(client, "/ledger/voucher", {
+                "date": TODAY,
+                "description": "Purregebyr / Reminder fee",
+                "postings": postings,
+            })
+            logger.info(f"overdue_reminder: posted fee voucher id={v.get('id') if v else None}")
+        except Exception as exc:
+            logger.error(f"overdue_reminder: fee voucher failed: {exc}")
+
+    # ── Create reminder invoice and send ──────────────────────────────
+    if customer_id:
+        try:
+            order = _post_value_with_heal(client, "/order", {
+                "customer": {"id": customer_id},
+                "orderDate": TODAY,
+                "deliveryDate": TODAY,
+                "orderLines": [{
+                    "description": "Purregebyr / Reminder fee",
+                    "count": 1,
+                    "unitPriceExcludingVatCurrency": fee_amount,
+                }],
+            })
+            if order:
+                order_id = order["id"]
+                logger.info(f"overdue_reminder: created order id={order_id}")
+
+                # Convert to invoice
+                inv_result = client.put(f"/order/{order_id}/:invoice?invoiceDate={TODAY}")
+                reminder_inv = (inv_result or {}).get("value")
+                if reminder_inv:
+                    reminder_inv_id = reminder_inv["id"]
+                    logger.info(f"overdue_reminder: created reminder invoice id={reminder_inv_id}")
+
+                    # Send invoice
+                    if send_invoice:
+                        try:
+                            client.put(f"/invoice/{reminder_inv_id}/:send?sendType=EMAIL")
+                            logger.info(f"overdue_reminder: sent reminder invoice via EMAIL")
+                        except Exception:
+                            try:
+                                client.put(f"/invoice/{reminder_inv_id}/:send?sendType=EHF")
+                                logger.info(f"overdue_reminder: sent reminder invoice via EHF")
+                            except Exception as exc:
+                                logger.warning(f"overdue_reminder: could not send invoice: {exc}")
+        except Exception as exc:
+            logger.error(f"overdue_reminder: reminder invoice creation failed: {exc}")
+
+    # ── Register partial payment on the overdue invoice ───────────────
+    if partial_payment and float(partial_payment) > 0:
+        payment_type_id = _get_default_payment_type(client)
+        if payment_type_id:
+            payment_url = (
+                f"/invoice/{invoice_id}/:payment"
+                f"?paymentDate={TODAY}"
+                f"&paymentTypeId={payment_type_id}"
+                f"&paidAmount={partial_payment}"
+            )
+            try:
+                client.put(payment_url)
+                logger.info(f"overdue_reminder: registered partial payment {partial_payment} on invoice {invoice_id}")
+            except Exception as exc:
+                logger.error(f"overdue_reminder: partial payment failed: {exc}")

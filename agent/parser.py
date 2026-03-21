@@ -243,6 +243,43 @@ ledger_task
     de: "Buchhaltungsdimension", "benutzerdefinierte Dimension", "Kostenstelle"
     fr: "dimension comptable", "dimension personnalisée", "centre de coûts"
 
+bank_reconciliation
+  Reconcile a bank statement (CSV or PDF) against invoices and suppliers.
+  Use when the task mentions: "reconcile bank statement", "bank reconciliation",
+  "avstemme bankutskrift", "bankutskrift", "bank statement", "Kontoauszug",
+  "relevé bancaire", "extracto bancario", "extrato bancário", "avstemming".
+  The attached file (CSV/PDF) contains a list of bank transactions.
+  Extract under bank_statement:
+    - transactions: array of objects, one per row in the statement:
+        {{"date": "YYYY-MM-DD", "amount": number (positive=incoming, negative=outgoing),
+          "type": "customer_payment"|"supplier_payment"|"interest_income"|"interest_expense"|"tax"|"fee"|"salary"|"other",
+          "counterparty": "name of customer or supplier",
+          "reference": "invoice number or reference text",
+          "description": "original description from CSV"}}
+    Classify each transaction:
+      - Positive amounts referencing a customer/invoice → "customer_payment"
+      - Negative amounts referencing a supplier/vendor → "supplier_payment"
+      - Interest credited → "interest_income"
+      - Interest debited → "interest_expense"
+      - Tax deductions (skattetrekk, tax) → "tax"
+      - Fees (gebyr, fee) → "fee"
+      - Salary/payroll → "salary"
+      - Everything else → "other"
+
+overdue_reminder
+  Find an overdue invoice and process a reminder.
+  Use when the task mentions: "overdue invoice", "reminder fee", "purregebyr",
+  "forfalt faktura", "inkassogebyr", "purring", "Mahngebühr", "überfällig",
+  "frais de rappel", "facture en retard", "cargo por mora", "factura vencida",
+  "taxa de lembrete", "fatura vencida".
+  Extract under reminder:
+    - fee_amount: the reminder fee in NOK (e.g. 70)
+    - debit_account: account to debit (e.g. "1500" for accounts receivable)
+    - credit_account: account to credit (e.g. "3400" for reminder fees revenue)
+    - partial_payment_amount: if also registering a partial payment on the overdue invoice
+    - send_invoice: true if the prompt asks to send/email the reminder invoice
+  Extract under customer: name (if specified).
+
 NOT SUPPORTED — use task_type "unknown" for:
   - Any task not listed above
 
@@ -497,6 +534,12 @@ def _parse_task_sync(prompt: str, files: list[FileAttachment]) -> dict[str, Any]
         elif f.mime_type == "application/pdf":
             pdf_text = _extract_pdf_text(f.content_base64, f.filename)
             parts.append(types.Part.from_text(text=pdf_text))
+        elif f.mime_type in ("text/csv", "application/csv") or f.filename.endswith(".csv"):
+            try:
+                csv_text = base64.b64decode(f.content_base64).decode("utf-8", errors="replace")
+                parts.append(types.Part.from_text(text=f"[CSV: {f.filename}]\n{csv_text[:8000]}"))
+            except Exception:
+                parts.append(types.Part.from_text(text=f"[Attached CSV: {f.filename} – could not decode]"))
         else:
             parts.append(types.Part.from_text(text=f"[Attached file: {f.filename} ({f.mime_type})]"))
 

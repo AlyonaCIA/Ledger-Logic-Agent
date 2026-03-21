@@ -10,8 +10,8 @@ import requests
 logger = logging.getLogger(__name__)
 
 # Hard cap: abort if we ever exceed this many API calls in one request.
-# Keeps efficiency bonus intact and prevents runaway retry loops.
-MAX_CALLS_PER_REQUEST = 25
+# Bank reconciliation and complex tasks may need up to ~40 calls.
+MAX_CALLS_PER_REQUEST = 45
 
 
 class BudgetExceededError(RuntimeError):
