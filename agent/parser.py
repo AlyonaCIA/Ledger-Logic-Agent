@@ -197,11 +197,12 @@ delete_voucher
   Put any identifying info in notes.
 
 ledger_task
-  Post complex ledger entries: corrections, depreciation, monthly/annual close.
+  Post complex ledger entries: corrections, depreciation, monthly/annual close,
+  OR create custom (free) accounting dimensions with values and optional voucher.
   Use when the task involves reversing wrong vouchers, posting depreciation entries,
-  or doing period-end accounting close.
+  doing period-end accounting close, OR creating custom accounting dimensions.
   Extract under ledger:
-    - subtask: one of "correction", "depreciation", "monthly_close", "annual_close", "voucher"
+    - subtask: one of "correction", "depreciation", "monthly_close", "annual_close", "custom_dimension", "voucher"
     - description: description of what is being posted
     - date (YYYY-MM-DD): accounting date for the entry (default today)
     - date_from, date_to: date range to search for vouchers to correct (for "correction")
@@ -210,10 +211,23 @@ ledger_task
     - annual_amount: depreciation amount per year if directly stated
     - depreciation_account: GL account number for depreciation expense (default "6010")
     - accumulated_account: GL account number for accumulated depreciation (default "1209")
-    - postings: array of {{account_number, account_name (optional), amount}} for generic entries
+    - dimension_name: name of the custom accounting dimension (for "custom_dimension")
+      e.g. "Kostsenter", "Prosjektgruppe", "Region"
+    - dimension_values: array of {{name, number}} for each value to create under the dimension
+      e.g. [{{"name": "Økonomi", "number": "1"}}, {{"name": "Produktutvikling", "number": "2"}}]
+    - postings: array of {{account_number, account_name (optional), amount, dimension_value (optional)}} for entries
+      dimension_value: which dimension value name to assign to this posting (for "custom_dimension")
+
+  CUSTOM DIMENSION MATCHING — use subtask "custom_dimension" when the prompt mentions:
+    nb: "regnskapsdimensjon", "fri dimensjon", "kostsenter", "kostnadsbærer"
+    nn: "rekneskapsdimensjon", "fri dimensjon"
+    en: "accounting dimension", "custom dimension", "cost center dimension"
+    es: "dimensión contable", "dimensión personalizada"
+    pt: "dimensão contábil", "dimensão personalizada"
+    de: "Buchhaltungsdimension", "benutzerdefinierte Dimension", "Kostenstelle"
+    fr: "dimension comptable", "dimension personnalisée", "centre de coûts"
 
 NOT SUPPORTED — use task_type "unknown" for:
-  - Free accounting dimensions / free dimensions ("fri regnskapsdimensjon", "dimensión contable libre")
   - Any task not listed above
 
 ══════════════════════════════════════════════

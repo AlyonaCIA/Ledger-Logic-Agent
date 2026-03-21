@@ -22,6 +22,7 @@ RUN uv pip install --system --no-cache \
 # Copy application source
 COPY main.py .
 COPY agent/ ./agent/
+COPY gold/ ./gold/
 
 # Cloud Run injects PORT; default 8080
 ENV PORT=8080

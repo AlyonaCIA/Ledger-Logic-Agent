@@ -135,7 +135,10 @@ class TripletexClient:
             self.call_log.append(log_entry)
 
         if resp.content:
-            return resp.json()
+            try:
+                return resp.json()
+            except ValueError:
+                return None
         return None
 
     # ------------------------------------------------------------------ #
@@ -148,8 +151,8 @@ class TripletexClient:
     def post(self, path: str, json: Any = None) -> Any:
         return self._call("POST", path, json=json)
 
-    def put(self, path: str, json: Any = None) -> Any:
-        return self._call("PUT", path, json=json)
+    def put(self, path: str, json: Any = None, params: dict | None = None) -> Any:
+        return self._call("PUT", path, json=json, params=params)
 
     def delete(self, path: str) -> Any:
         return self._call("DELETE", path)

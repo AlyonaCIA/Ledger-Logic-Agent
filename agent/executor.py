@@ -166,14 +166,15 @@ _KEYWORD_MAP: list[tuple[list[str], str]] = [
     (["travel", "reise", "viaje", "voyage", "dienstreise", "utlegg", "expense"], "create_travel_expense"),
     # ledger task → ledger_task
     (["depreciation", "avskrivning", "monthly close", "annual close", "ledger correction",
-      "reverse voucher", "ledger task", "regnskap"], "ledger_task"),
+      "reverse voucher", "ledger task", "regnskap",
+      "accounting dimension", "regnskapsdimensjon", "dimensión contable",
+      "dimensão contábil", "dimension comptable", "buchhaltungsdimension",
+      "kostnadsbærer", "kostsenter", "fri dimensjon"], "ledger_task"),
 ]
 
 
 _NOT_SUPPORTED_KEYWORDS: list[str] = [
-    # Free accounting dimensions
-    "fri regnskapsdimensjon",
-    "dimensión contable libre",
+    # (none currently)
 ]
 
 
@@ -522,10 +523,17 @@ def _create_product(intent: dict, client: TripletexClient) -> None:
         payload["priceExcludingVatCurrency"] = prod["price_excl_vat"]
     if prod.get("description"):
         payload["description"] = prod["description"]
-    if prod.get("unit"):
-        # Tripletex uses a unit object; try standard unit id 1000 (ea)
-        # We set the display unit via the unit field if available
-        pass
+
+    # Resolve vatType by rate (25 → code 3, 15 → code 31, 0 → code 6)
+    vat_rate = prod.get("vat_rate")
+    if vat_rate is not None:
+        vat_number = {25: "3", 15: "31", 0: "6"}.get(int(vat_rate), "3")
+        try:
+            vat_types = client.get_list("/ledger/vatType", params={"number": vat_number, "count": 1})
+            if vat_types:
+                payload["vatType"] = {"id": vat_types[0]["id"]}
+        except Exception as exc:
+            logger.warning(f"Could not resolve vatType for rate {vat_rate}: {exc}")
 
     result = _post_value_with_heal(client, "/product", payload)
     if result:
@@ -747,7 +755,10 @@ def _create_invoice(intent: dict, client: TripletexClient) -> None:
         # the invoice is already sent and the /:send call would 422.
         if not sent_via_flag:
             try:
-                client.put(f"/invoice/{invoice_id}/:send", json={"sendType": "EMAIL"})
+                client.put(
+                    f"/invoice/{invoice_id}/:send",
+                    params={"sendType": "EMAIL"},
+                )
                 logger.info(f"Sent invoice id={invoice_id}")
             except Exception:
                 pass  # sandbox may not support email sending
@@ -996,7 +1007,10 @@ def _create_credit_note(intent: dict, client: TripletexClient) -> None:
         """Try to send the invoice to move it out of DRAFT, then credit."""
         for send_type in ("EMAIL", "EHF", "EFAKTURA"):
             try:
-                client.put(f"/invoice/{invoice['id']}/:send", json={"sendType": send_type})
+                client.put(
+                    f"/invoice/{invoice['id']}/:send",
+                    params={"sendType": send_type},
+                )
                 break
             except Exception:
                 continue
@@ -1519,7 +1533,7 @@ def _run_payroll(intent: dict, client: TripletexClient) -> None:
     if not employee:
         # Create missing employee so the payroll can be linked
         dept_id = _get_default_department_id(client)
-        emp_payload: dict = {"userType": "STANDARD"}
+        emp_payload: dict = {"userType": "STANDARD" if email else "NO_ACCESS"}
         if emp_data.get("first_name"):
             emp_payload["firstName"] = emp_data["first_name"]
         elif identifier and not identifier.startswith("@"):
@@ -1540,17 +1554,28 @@ def _run_payroll(intent: dict, client: TripletexClient) -> None:
         except Exception as exc:
             logger.warning(f"Employee creation failed: {exc}")
 
-    # Create employment record so the employee is registered in the salary system
+    # Ensure employment record exists so the employee is in the salary system
     if employee:
+        has_employment = False
         try:
-            client.post("/employee/employment", json={
-                "employee": {"id": employee["id"]},
-                "startDate": TODAY,
-                "isMainEmployer": True,
-            })
-            logger.info(f"Created employment for employee id={employee['id']}")
-        except Exception as exc:
-            logger.debug(f"Employment creation skipped (may already exist): {exc}")
+            empls = client.get_list(
+                "/employee/employment",
+                params={"employeeId": employee["id"], "fields": "id,startDate,endDate"},
+            )
+            has_employment = bool(empls)
+        except Exception:
+            pass
+
+        if not has_employment:
+            try:
+                client.post("/employee/employment", json={
+                    "employee": {"id": employee["id"]},
+                    "startDate": TODAY,
+                    "isMainEmployer": True,
+                })
+                logger.info(f"Created employment for employee id={employee['id']}")
+            except Exception as exc:
+                logger.warning(f"Employment creation failed: {exc}")
 
     # ── Payroll amounts ───────────────────────────────────────────────
     base = float(payroll.get("base_salary") or 0)
@@ -1707,7 +1732,7 @@ def _create_project_invoice(intent: dict, client: TripletexClient) -> None:
 
     if not employee:
         dept_id = _get_default_department_id(client)
-        emp_payload: dict = {"userType": "STANDARD"}
+        emp_payload: dict = {"userType": "STANDARD" if email else "NO_ACCESS"}
         if emp_data.get("first_name"):
             emp_payload["firstName"] = emp_data["first_name"]
         elif identifier:
@@ -1992,10 +2017,11 @@ def _post_generic_ledger_postings(
 def _ledger_task(intent: dict, client: TripletexClient) -> None:
     """
     Handle complex ledger tasks:
-      - ledger_correction: reverse wrong voucher + post corrected entry
-      - ledger_depreciation: post annual/monthly depreciation voucher
-      - ledger_monthly_close / ledger_annual_close: accruals and close entries
-      - ledger_voucher (generic): post arbitrary voucher from intent
+      - custom_dimension: create free accounting dimension + values + optional voucher
+      - correction: reverse wrong voucher + post corrected entry
+      - depreciation: post annual/monthly depreciation voucher
+      - monthly_close / annual_close: accruals and close entries
+      - voucher (generic): post arbitrary voucher from intent
     """
     ledger = intent.get("ledger") or {}
     subtask = (ledger.get("subtask") or "voucher").lower()
@@ -2012,6 +2038,87 @@ def _ledger_task(intent: dict, client: TripletexClient) -> None:
             except Exception as exc:
                 logger.warning(f"Could not create account {number}: {exc}")
         return None
+
+    # ── Custom accounting dimensions ─────────────────────────────────
+    if subtask == "custom_dimension":
+        dim_name = ledger.get("dimension_name") or ""
+        dim_values = ledger.get("dimension_values") or []  # [{name, number}]
+
+        if not dim_name:
+            logger.error("custom_dimension: no dimension_name provided")
+            return
+
+        # 1. Create the dimension name
+        dim_result = _post_value_with_heal(
+            client, "/ledger/accountingDimensionName",
+            {"dimensionName": dim_name},
+        )
+        if not dim_result:
+            logger.error(f"Failed to create accounting dimension '{dim_name}'")
+            return
+        dim_index = dim_result.get("dimensionIndex")
+        logger.info(f"Created accounting dimension '{dim_name}' index={dim_index} id={dim_result.get('id')}")
+
+        # 2. Create each dimension value
+        created_values: list[dict] = []
+        for i, dv in enumerate(dim_values, 1):
+            val_payload: dict = {
+                "displayName": dv.get("name") or dv.get("displayName") or f"Value {i}",
+                "dimensionIndex": dim_index,
+                "number": str(dv.get("number") or i),
+            }
+            try:
+                val_result = _post_value_with_heal(
+                    client, "/ledger/accountingDimensionValue", val_payload,
+                )
+                if val_result:
+                    created_values.append(val_result)
+                    logger.info(f"Created dimension value '{val_payload['displayName']}' id={val_result.get('id')}")
+            except Exception as exc:
+                logger.warning(f"Dimension value '{val_payload['displayName']}' failed: {exc}")
+
+        # 3. If postings are provided, post a voucher with the dimension on each posting
+        postings_raw = ledger.get("postings") or []
+        if postings_raw and created_values:
+            dim_field = f"freeAccountingDimension{dim_index}" if dim_index else "freeAccountingDimension1"
+            # Use the first created value as default dimension on postings
+            default_dim_id = created_values[0].get("id")
+
+            resolved_postings = []
+            for row, p in enumerate(postings_raw, 1):
+                acct = _find_or_create_account(
+                    str(p.get("account_number") or ""), p.get("account_name"),
+                )
+                if acct:
+                    amt = float(p.get("amount") or 0)
+                    posting: dict = {
+                        "row": row,
+                        "account": {"id": acct["id"]},
+                        "amountGross": amt,
+                        "amountGrossCurrency": amt,
+                    }
+                    # Assign dimension value — use specific if provided, else default
+                    dim_val_name = (p.get("dimension_value") or "").lower()
+                    assigned_id = default_dim_id
+                    for cv in created_values:
+                        if (cv.get("displayName") or "").lower() == dim_val_name:
+                            assigned_id = cv.get("id")
+                            break
+                    if assigned_id:
+                        posting[dim_field] = {"id": assigned_id}
+                    resolved_postings.append(posting)
+
+            if resolved_postings:
+                try:
+                    v = _post_value_with_heal(client, "/ledger/voucher", {
+                        "date": ledger.get("date") or TODAY,
+                        "description": ledger.get("description") or f"Entry with dimension {dim_name}",
+                        "postings": resolved_postings,
+                    })
+                    logger.info(f"Posted voucher with dimension id={v.get('id') if v else None}")
+                except Exception as exc:
+                    logger.error(f"Voucher with dimension failed: {exc}")
+        return
 
     if subtask == "correction":
         # Reverse the erroneous voucher(s) and post corrected entries
