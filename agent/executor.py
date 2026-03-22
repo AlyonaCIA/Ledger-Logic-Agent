@@ -3691,6 +3691,71 @@ def _ledger_task(intent: dict, client: TripletexClient) -> None:
 
         used_voucher_ids: set[int] = set()
 
+        # ── Fallback: extract corrections from raw prompt when LLM didn't populate the list ──
+        if not corrections:
+            _raw = intent.get("_raw_prompt", "") or ledger.get("description", "")
+            _extracted: list[dict] = []
+
+            # wrong_account: "konto XXXX brukt i stedet for YYYY, beløp ZZZZ"
+            # Also: "account XXXX used instead of YYYY, amount ZZZZ"
+            for m in re.finditer(
+                r'(?:feil\s+konto|wrong\s+account|falsches\s+Konto|cuenta\s+incorrecta|conta\s+errada|mauvais\s+compte)\s*'
+                r'\(?(?:konto\s+)?(\d{4,5})\s*(?:brukt\s+i\s+stedet\s+for|used\s+instead\s+of|statt|en\s+lugar\s+de|em\s+vez\s+de|au\s+lieu\s+de)\s*(\d{4,5})'
+                r'[,.\s]*(?:beløp|amount|Betrag|importe|montante|montant)?\s*(\d[\d\s]*)\s*(?:kr\b)?',
+                _raw, re.IGNORECASE,
+            ):
+                _extracted.append({
+                    "error_type": "wrong_account",
+                    "wrong_account": m.group(1),
+                    "correct_account": m.group(2),
+                    "amount": float(m.group(3).replace(" ", "")),
+                })
+
+            # duplicate: "duplisert bilag (konto XXXX, beløp YYYY)"
+            for m in re.finditer(
+                r'(?:duplisert|duplicate|doppelt|duplicado|dupliquée?)\s*(?:bilag|voucher|Beleg|comprobante|documento|pièce)'
+                r'\s*\(?(?:konto\s+)?(\d{4,5})[,.\s]*(?:beløp|amount|Betrag|importe|montante|montant)?\s*(\d[\d\s]*)\s*(?:kr\b)?',
+                _raw, re.IGNORECASE,
+            ):
+                _extracted.append({
+                    "error_type": "duplicate",
+                    "wrong_account": m.group(1),
+                    "amount": float(m.group(2).replace(" ", "")),
+                })
+
+            # missing_vat: "manglende MVA-linje (konto XXXX, beløp ekskl. YYYY kr mangler MVA på konto ZZZZ)"
+            for m in re.finditer(
+                r'(?:manglende\s+MVA|missing\s+VAT|fehlende\s+MwSt|IVA\s+faltante|TVA\s+manquante)'
+                r'[^(]*\(?(?:konto\s+)?(\d{4,5})[,.\s]*(?:beløp\s+)?(?:ekskl\.?\s*)?(\d[\d\s]*)\s*(?:kr\b)?'
+                r'.*?(?:konto|account|Konto|cuenta|conta|compte)\s*(\d{4,5})',
+                _raw, re.IGNORECASE,
+            ):
+                _extracted.append({
+                    "error_type": "missing_vat",
+                    "wrong_account": m.group(1),
+                    "amount_excl_vat": float(m.group(2).replace(" ", "")),
+                    "vat_account": m.group(3),
+                })
+
+            # wrong_amount: "feil beløp (konto XXXX, YYYY kr bokført i stedet for ZZZZ kr)"
+            for m in re.finditer(
+                r'(?:feil\s+beløp|wrong\s+amount|falscher\s+Betrag|importe\s+incorrecto|montante\s+errado|montant\s+erroné)'
+                r'[^(]*\(?(?:konto\s+)?(\d{4,5})[,.\s]*(\d[\d\s]*)\s*(?:kr\b)?'
+                r'\s*(?:bokført\s+i\s+stedet\s+for|instead\s+of|statt|en\s+lugar\s+de|em\s+vez\s+de|au\s+lieu\s+de)\s*'
+                r'(\d[\d\s]*)\s*(?:kr\b)?',
+                _raw, re.IGNORECASE,
+            ):
+                _extracted.append({
+                    "error_type": "wrong_amount",
+                    "wrong_account": m.group(1),
+                    "amount": float(m.group(2).replace(" ", "")),
+                    "correct_amount": float(m.group(3).replace(" ", "")),
+                })
+
+            if _extracted:
+                corrections = _extracted
+                logger.info(f"Correction fallback: extracted {len(corrections)} corrections from raw prompt")
+
         if corrections:
             for corr in corrections:
                 error_type = corr.get("error_type", "")
