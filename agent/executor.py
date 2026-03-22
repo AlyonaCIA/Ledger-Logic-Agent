@@ -1720,6 +1720,11 @@ def _create_credit_note(intent: dict, client: TripletexClient) -> None:
             pass  # send might fail but credit note might still work
         return _do_credit_note()
 
+    # If invoice is already credited, it's idempotent success — nothing to do.
+    if invoice.get("isCredited"):
+        logger.info(f"Invoice {invoice['id']} already has a credit note (isCredited=true) – treating as success")
+        return
+
     try:
         result = _do_credit_note()
         if result:
@@ -1727,6 +1732,14 @@ def _create_credit_note(intent: dict, client: TripletexClient) -> None:
     except requests.exceptions.HTTPError as exc:
         status_code = exc.response.status_code if exc.response is not None else 0
         if status_code in (404, 422):
+            # Check if the invoice was credited in a concurrent run
+            try:
+                refreshed = client.get_value(f"/invoice/{invoice['id']}", params={"fields": "id,isCredited"})
+                if (refreshed or {}).get("isCredited"):
+                    logger.info(f"Invoice {invoice['id']} was already credited (confirmed on refresh) – treating as success")
+                    return
+            except Exception:
+                pass
             # Invoice needs to be sent before credit noting
             logger.warning(f"{status_code} on credit note for invoice {invoice['id']} – sending invoice first")
             try:
@@ -4906,7 +4919,19 @@ def _overdue_reminder(intent: dict, client: TripletexClient) -> None:
                 })
                 if order:
                     order_id = order["id"]
-                    inv_result = client.put(f"/order/{order_id}/:invoice?invoiceDate={TODAY}")
+                    inv_result = None
+                    for _retry in range(3):
+                        try:
+                            inv_result = client.put(f"/order/{order_id}/:invoice?invoiceDate={TODAY}")
+                            if (inv_result or {}).get("value"):
+                                break
+                        except Exception as _exc:
+                            logger.warning(f"overdue_reminder: PUT /order/:invoice attempt {_retry + 1} failed: {_exc}")
+                            if _retry < 2:
+                                import time as _time
+                                _time.sleep(2)
+                            else:
+                                raise
                     reminder_inv = (inv_result or {}).get("value")
                     if reminder_inv:
                         reminder_inv_id = reminder_inv["id"]

@@ -229,7 +229,7 @@ def resolve_invoice(
         "invoiceDateFrom": date_from,
         "invoiceDateTo": date_to,
         "count": 100,
-        "fields": "id,invoiceNumber,amount,amountOutstanding,amountCurrency,customer",
+        "fields": "id,invoiceNumber,amount,amountOutstanding,amountCurrency,customer,isCredited,isCreditNote",
     }
     if customer_id:
         params["customerId"] = customer_id
@@ -263,6 +263,13 @@ def resolve_invoice(
             if str(i.get("invoiceNumber", "")) == inv_no:
                 return i
 
-    # Prefer unpaid
-    unpaid = [i for i in invoices if (i.get("amountOutstanding") or 0) > 0]
-    return unpaid[0] if unpaid else invoices[0]
+    # Prefer not-yet-credited invoices with outstanding balance
+    not_credited = [i for i in invoices if not i.get("isCredited") and not i.get("isCreditNote")]
+    unpaid = [i for i in not_credited if (i.get("amountOutstanding") or 0) > 0]
+    if unpaid:
+        return unpaid[0]
+    if not_credited:
+        return not_credited[0]
+    # Fallback: prefer unpaid regardless
+    unpaid_any = [i for i in invoices if (i.get("amountOutstanding") or 0) > 0]
+    return unpaid_any[0] if unpaid_any else invoices[0]
