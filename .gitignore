@@ -1,7 +1,7 @@
-# ── Secrets – NEVER commit these ──────────────────────────────────────────
+# ── Secrets ───────────────────────────────────────────────────────────────
 .env
 .env.*
-!.env.example        # keep the template, not the real values
+!.env.example
 secrets/
 *.key
 *.pem
@@ -18,26 +18,33 @@ dist/
 build/
 *.egg-info/
 .eggs/
+.pytest_cache/
 
 # ── uv / pip ──────────────────────────────────────────────────────────────
 .python-version
 
-# ── Logs & episode data (gold dataset – data files, not source) ───────────
+# ── Development scripts & tests (not part of the agent) ───────────────────
+scripts/
+tests/
+
+# ── Logs & episode data ──────────────────────────────────────────────────
 *.log
 *.tmp
 /tmp/
 logs/*.jsonl
-# root-level legacy episode file
 episodes.jsonl
-# Gold dataset — generated, not source-controlled
-gold/*.jsonl
 
-# Keep the directory itself tracked via .gitkeep
+# ── Gold examples (runtime dependency — keep prompts.jsonl tracked) ───────
+gold/*.jsonl
+!gold/prompts.jsonl
 !logs/.gitkeep
 !gold/.gitkeep
+
+# ── API spec duplicates ──────────────────────────────────────────────────
+openapi-test.json
 
 # ── Cloud Run / deploy artefacts ──────────────────────────────────────────
 .cloud-run-url
 
-# ── macOS ──────────────────────────────────────────────────────────────────
+# ── macOS ─────────────────────────────────────────────────────────────────
 .DS_Store
