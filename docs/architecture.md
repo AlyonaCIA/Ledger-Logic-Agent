@@ -1,8 +1,7 @@
 # Ledger Logic Agent — Architecture
 
-**Current revision:** `ledger-logic-agent-00016-lfj`  
-**Local simulator score:** 12/14 tasks · 71/73 checks  
-**Competition score:** 5/7 (71%) — submitted with `00012-sn2`; `00016-lfj` is awaiting resubmission
+**Current revision:** `ledger-logic-agent-00069-tz5`  
+**Competition score:** 42.12 · 30/30 tasks covered · 25 workflow handlers
 
 ---
 
@@ -30,7 +29,7 @@
                                              │
                      ┌───────────────────────▼──────────────────────────────┐
                      │        Task Executor  (executor.py)                  │
-                     │   16 workflow handlers · deterministic dispatch       │
+                     │   25 workflow handlers · deterministic dispatch       │
                      │   confidence < 0.25 → keyword fallback → skip        │
                      │                                                       │
                      │   ┌─────────────────────────────────────────────┐    │
@@ -196,6 +195,37 @@ Call budget impact: at most +1 API call + 1 Gemini call per failing endpoint. Bu
 | Invoice requires bank account | Sandbox without bank account → 422 on `POST /invoice`; fix requires web UI config |
 | `GET /invoice` mandatory dates | `invoiceDateFrom` + `invoiceDateTo` required or 422 |
 | `POST /orderline` not `/order/{id}/orderLines` | Correct Tripletex v2 endpoint for adding lines |
+| Invoice `:send` enum | `PUT /invoice/{id}/:send` requires `sendType` query param (EMAIL/MANUAL/etc.) |
+| Employment `startDate` floor | Tripletex rejects start dates before company founding; clamp to company date |
+| Customer `language` enum | Only 1=NO, 2=EN accepted; anything else → 422 |
+
+---
+
+## 6. Recent Changes (v00050–v00069)
+
+### 6.1 Invoice send flow rewrite (v00069)
+**Root cause:** `sendToCustomer=true` on POST returns 422 if no bank account configured.  
+**Fix:** Always POST with `sendToCustomer=false`, then `PUT /invoice/{id}/:send` with `sendType=EMAIL`. Falls back to `sendType=MANUAL` if EMAIL fails.
+
+### 6.2 Customer language clamping (v00069)
+**Root cause:** LLM extracts language codes like "PT" or "FR" which Tripletex rejects.  
+**Fix:** Clamp `language` field to 1 (NO) or 2 (EN) only; default to 2 for non-Norwegian.
+
+### 6.3 German job titles → occupation codes (v00069)
+**Root cause:** German prompts use job titles like "Buchhalter" that don't map to Norwegian occupation codes.  
+**Fix:** Added German→occupation code mapping table.
+
+### 6.4 Contact person creation (v00069)
+**Root cause:** Contact person handler was missing customer resolution.  
+**Fix:** Resolve customer by name from entities before creating contact.
+
+### 6.5 Receipt booking with department (v00067)
+**Root cause:** Receipt tasks require posting to correct account AND department.  
+**Fix:** Added `book_receipt` handler with account mapping and department resolution.
+
+### 6.6 Bank reconciliation (v00065)
+**Root cause:** Bank reconciliation tasks were unhandled.  
+**Fix:** Added `bank_reconciliation` handler with statement matching logic.
 
 ---
 
