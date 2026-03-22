@@ -3,8 +3,8 @@
 AI agent that interprets natural-language accounting prompts (in **7 languages**) and executes the correct Tripletex ERP API calls — with self-healing retries, few-shot learning, and a full offline gold loop.
 
 Built for the [AINM Tripletex competition](https://app.ainm.no/submit/tripletex).  
-**Deployed revision:** `ledger-logic-agent-00022-tmq` · **Score:** 33.6 (position 82)  
-**Locally verified:** create_invoice ✓ · create_credit_note ✓ · register_payment ✓ · create_employee ✓ · create_department ✓
+**Deployed revision:** `ledger-logic-agent-00069-tz5` · **Score:** 42.12 · **30/30 tasks covered**  
+**25 workflow handlers** — customers, employees, invoices, projects, payroll, bank reconciliation, overdue reminders, and more.
 
 ---
 
@@ -28,7 +28,7 @@ Built for the [AINM Tripletex competition](https://app.ainm.no/submit/tripletex)
                                                 │
                         ┌───────────────────────▼────────────────────────────┐
                         │           Task Executor  (executor.py)             │
-                        │   16 workflow handlers · deterministic dispatch     │
+                        │   25 workflow handlers · deterministic dispatch     │
                         │   ┌──────────────────────────────────────────────┐ │
                         │   │  Entity Resolver  (matchers.py)              │ │
                         │   │  resolve_customer / employee / invoice       │ │
@@ -51,13 +51,7 @@ Built for the [AINM Tripletex competition](https://app.ainm.no/submit/tripletex)
                                                 │
                         ┌───────────────────────▼────────────────────────────┐
                         │   Episode Log  (logs/episodes.jsonl)               │
-                        └───────────────────────┬────────────────────────────┘
-                                                │
-              ┌──────────────────────────────── ▼ ─── offline learning loop ──────────────────────────┐
-              │   make gold       gold_builder.py  →  gold/prompts.jsonl  (injected as few-shots)      │
-              │   make critique   critic.py        →  logs/critiques.jsonl (LLM-as-judge on failures)  │
-              │   make analyze    analyze.py        →  actionable insights from Cloud Logging           │
-              └───────────────────────────────────────────────────────────────────────────────────────┘
+                        └────────────────────────────────────────────────────┘
 ```
 
 See [docs/architecture.md](docs/architecture.md) for design decisions, API quirks, and the full change log.
@@ -70,7 +64,7 @@ See [docs/architecture.md](docs/architecture.md) for design decisions, API quirk
 .
 ├── agent/
 │   ├── client.py           # Tripletex REST wrapper · call budget · 4xx/5xx tracking
-│   ├── executor.py         # 16 task workflows · self-healing helper
+│   ├── executor.py         # 25 task workflows · self-healing helper
 │   ├── healer.py           # Gemini-powered 422 payload repair (self-healing)
 │   ├── matchers.py         # Entity resolvers — customer / employee / invoice / dept
 │   ├── models.py           # Pydantic request/response models
@@ -79,24 +73,15 @@ See [docs/architecture.md](docs/architecture.md) for design decisions, API quirk
 ├── docs/
 │   └── architecture.md     # Design decisions and change log
 ├── gold/
-│   ├── .gitkeep
-│   └── prompts.jsonl       # Verified few-shot examples (gitignored, built by make gold)
+│   └── prompts.jsonl       # Verified few-shot examples (built by gold_builder)
 ├── logs/
 │   └── episodes.jsonl      # One JSON line per request (gitignored)
-├── scripts/
-│   ├── analyze.py          # Cloud Logging → insights
-│   ├── critic.py           # LLM-as-judge on failing episodes
-│   └── gold_builder.py     # Filter passing episodes → gold/prompts.jsonl
-├── tests/
-│   ├── simulate_evaluator.py   # Full competition simulator (14 tasks, 7 languages)
-│   ├── shadow_check.py         # Read-only sandbox verification
-│   ├── test_runner.py          # Integration tests
-│   └── test_sandbox.py         # Connectivity tests
 ├── main.py                 # FastAPI app — POST /, POST /solve, GET /health
 ├── Dockerfile              # linux/amd64 for Cloud Run
 ├── deploy.sh               # Build → push → deploy
 ├── Makefile                # Dev targets (make help)
-└── pyproject.toml          # Dependencies (uv)
+├── pyproject.toml          # Dependencies (uv)
+└── LICENSE                 # MIT
 ```
 
 ---
@@ -166,7 +151,7 @@ make help
 
 ```bash
 curl https://ledger-logic-agent-xrgiacpg2q-ew.a.run.app/health
-# → {"status":"ok","version":"1.0.0","git_sha":"ledger-logic-agent-00022-tmq"}
+# → {"status":"ok","version":"1.0.0","git_sha":"ledger-logic-agent-00069-tz5"}
 ```
 
 **Rule:** the `git_sha` must change after every deploy before submitting to the competition.
@@ -237,14 +222,22 @@ make analyze                # fetch last 30 min and print insights
 | `delete_employee` | Remove an employee |
 | `create_product` | Create a product/service with price and VAT rate |
 | `create_invoice` | Customer → Order → Invoice → Send (with self-healing on 422) |
+| `create_supplier_invoice` | Register a supplier invoice with voucher lines |
 | `register_payment` | Register a payment against an existing invoice |
 | `create_credit_note` | Reverse an invoice with a credit note |
 | `create_travel_expense` | File a travel expense report for an employee |
 | `delete_travel_expense` | Delete a travel expense |
 | `create_project` | Create a billable project linked to a customer |
+| `create_project_invoice` | Invoice hours/costs from a project |
 | `create_department` | Create a department (idempotent — searches before creating) |
+| `create_contact` | Create a contact person for a customer |
 | `enable_module` | Enable department / project / travel-expense accounting |
 | `delete_voucher` | Delete / reverse a ledger voucher |
+| `run_payroll` | Execute payroll run for a period |
+| `ledger_task` | Generic GL journal entries and corrections |
+| `bank_reconciliation` | Reconcile bank statements with ledger |
+| `overdue_reminder` | Generate and send overdue payment reminders |
+| `book_receipt` | Book a receipt to the correct account and department |
 
 All tasks support multilingual prompts: **nb · nn · en · es · pt · de · fr**.
 
