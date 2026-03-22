@@ -436,7 +436,8 @@ _KEYWORD_MAP: list[tuple[list[str], str]] = [
     # department / avdeling → create_department
     (["department", "avdeling", "departamento", "departement", "abteilung", "département"], "create_department"),
     # contact / kontaktperson → create_contact
-    (["kontaktperson", "contact person", "kontakt", "contacto", "Kontaktperson", "personne de contact"], "create_contact"),
+    (["kontaktperson", "contact person", "Kontaktperson", "personne de contact",
+      "persona de contacto", "pessoa de contato", "ansprechpartner"], "create_contact"),
     # project / prosjekt → create_project
     (["project", "prosjekt", "proyecto", "projet", "projekt", "Projekt"], "create_project"),
     # payment → register_payment
@@ -674,7 +675,7 @@ def _create_employee(intent: dict, client: TripletexClient) -> None:
             employment_id = emp_record.get("id")
             logger.info(f"Created employment id={employment_id} for employee {employee['id']}")
     except Exception as exc:
-        logger.debug(f"Employment creation failed: {exc}")
+        logger.warning(f"Employment creation failed (will retry): {exc}")
         # Tripletex may require dateOfBirth – ensure it's set via PUT then retry
         try:
             dob = emp.get("date_of_birth") or "1990-01-01"
@@ -756,6 +757,19 @@ def _create_employee(intent: dict, client: TripletexClient) -> None:
                 "chef de projet": "prosjektleder", "projektleiter": "prosjektleder",
                 "jefe de proyecto": "prosjektleder", "gerente": "leder",
                 "conseiller": "rådgiver", "berater": "rådgiver", "asesor": "rådgiver",
+                # German job titles
+                "entwickler": "utvikler", "softwareentwickler": "utvikler",
+                "buchhalter": "regnskapsfører", "sachbearbeiter": "saksbehandler",
+                "sekretär": "sekretær", "verwaltung": "administrasjon",
+                "leiter": "leder", "abteilungsleiter": "avdelingsleder",
+                "geschäftsführer": "daglig leder", "analyst": "analytiker",
+                # Portuguese/Spanish job titles
+                "desenvolvedor": "utvikler", "contador": "regnskapsfører",
+                "gerente de projeto": "prosjektleder", "analista": "analytiker",
+                "ingeniero": "ingeniør", "contador público": "regnskapsfører",
+                # French
+                "développeur": "utvikler", "comptable": "regnskapsfører",
+                "analyste": "analytiker", "secrétaire": "sekretær",
             }
             for foreign, norwegian in _JOB_TITLE_MAP.items():
                 if foreign in job_title.lower():
@@ -889,7 +903,11 @@ def _create_customer(intent: dict, client: TripletexClient) -> None:
     if cust.get("description"):
         payload["description"] = cust["description"]
     if cust.get("language"):
-        payload["language"] = cust["language"].upper()
+        lang = cust["language"].upper()
+        # Tripletex only accepts NO/EN for language field
+        if lang not in ("NO", "EN"):
+            lang = "EN"  # international fallback
+        payload["language"] = lang
     if cust.get("is_private_individual"):
         payload["isPrivateIndividual"] = True
     if cust.get("invoices_due_in"):
@@ -1324,14 +1342,23 @@ def _create_invoice(intent: dict, client: TripletexClient) -> None:
             f"Created invoice id={invoice_id} number={invoice.get('invoiceNumber')}"
         )
         # Always send explicitly — invoice was created as draft
-        try:
-            client.put(
-                f"/invoice/{invoice_id}/:send",
-                params={"sendType": "EMAIL", "overrideEmailAddress": "noreply@example.com"},
-            )
-            logger.info(f"Sent invoice id={invoice_id}")
-        except Exception:
-            pass  # sandbox may not support email sending
+        sent_ok = False
+        for send_type in ("EMAIL", "MANUAL"):
+            try:
+                send_params: dict = {"sendType": send_type}
+                if send_type == "EMAIL":
+                    send_params["overrideEmailAddress"] = "noreply@example.com"
+                client.put(
+                    f"/invoice/{invoice_id}/:send",
+                    params=send_params,
+                )
+                logger.info(f"Sent invoice id={invoice_id} via {send_type}")
+                sent_ok = True
+                break
+            except Exception as exc:
+                logger.warning(f"Invoice :send ({send_type}) failed for id={invoice_id}: {exc}")
+        if not sent_ok:
+            logger.warning(f"All :send attempts failed for invoice {invoice_id}")
 
         # ── Step 5: register payment if prompt asks for it ────────────
         # Some prompts combine create+pay: "...og registrer full betaling"
@@ -2599,20 +2626,26 @@ def _create_contact(intent: dict, client: TripletexClient) -> None:
     if contact.get("phone"):
         payload["phoneNumberMobile"] = contact["phone"]
 
-    # Resolve customer or supplier reference
-    cust_name = cust_data.get("name") or cust_data.get("identifier")
-    org_no = cust_data.get("org_number")
-    is_supplier = bool(cust_data.get("is_supplier"))
+    # The parser may put customer/supplier references inside the contact dict
+    # (contact.customer_name, contact.org_number) OR in the intent-level customer dict.
+    cust_name = (
+        cust_data.get("name") or cust_data.get("identifier")
+        or contact.get("customer_name")
+    )
+    org_no = cust_data.get("org_number") or contact.get("org_number")
+    supplier_name = contact.get("supplier_name")
+    is_supplier = bool(cust_data.get("is_supplier")) or bool(supplier_name)
 
     if is_supplier:
         # Try to find supplier
         supplier = None
+        s_name = supplier_name or cust_name
         if org_no:
             results = client.get_list("/supplier", params={"organizationNumber": org_no, "count": 5})
             supplier = results[0] if results else None
-        if not supplier and cust_name:
+        if not supplier and s_name:
             results = client.get_list("/supplier", params={"count": 100})
-            name_lower = cust_name.lower()
+            name_lower = s_name.lower()
             supplier = next((s for s in results if name_lower in (s.get("name") or "").lower()), None)
         if supplier:
             payload["supplier"] = {"id": supplier["id"]}
@@ -2620,6 +2653,15 @@ def _create_contact(intent: dict, client: TripletexClient) -> None:
         customer = None
         if cust_name or org_no:
             customer = resolve_customer(client, name=cust_name, org_number=org_no)
+        if not customer and cust_name:
+            # Customer doesn't exist yet — create them
+            try:
+                cust_payload: dict = {"isCustomer": True, "name": cust_name}
+                if org_no:
+                    cust_payload["organizationNumber"] = org_no
+                customer = _post_value_with_heal(client, "/customer", cust_payload)
+            except Exception:
+                customer = None
         if customer:
             payload["customer"] = {"id": customer["id"]}
 
