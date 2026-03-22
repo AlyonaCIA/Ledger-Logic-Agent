@@ -252,6 +252,24 @@ def execute_task(intent: dict[str, Any], client: TripletexClient) -> None:
             intent["task_type"] = task_type
             logger.info("Post-LLM correction: create_project_invoice → create_project (full cycle)")
 
+    # Reclassify create_project → ledger_task/analysis when prompt is about analyzing ledger + creating projects
+    if task_type == "create_project" and _raw:
+        p_low = _raw.lower()
+        _analysis_kws = [
+            "analyser hovudboka", "analyser hovedboken", "analyze the ledger",
+            "analysiere das hauptbuch", "analizar el libro mayor", "analisar o razão",
+            "analyser le grand livre", "balance sheet", "balanse",
+            "kostnadsøkning", "kostnadsvekst", "cost increase", "kostensteigerung",
+            "aumento de costes", "aumento de custos", "augmentation des coûts",
+        ]
+        if any(kw in p_low for kw in _analysis_kws):
+            task_type = "ledger_task"
+            intent["task_type"] = task_type
+            if not intent.get("ledger"):
+                intent["ledger"] = {}
+            intent["ledger"]["subtask"] = "analysis_create_projects"
+            logger.info("Post-LLM correction: create_project → ledger_task/analysis_create_projects")
+
     # (I) Payroll misclassified as travel_expense, create_invoice, unknown, or other
     if task_type in ("create_travel_expense", "create_invoice", "create_supplier_invoice",
                      "ledger_task", "create_employee", "unknown") and _raw:
@@ -2270,7 +2288,7 @@ def _create_project(intent: dict, client: TripletexClient) -> None:
 
     # ── Parse full project cycle extras from raw prompt ──────────────
     # Budget
-    budget_match = re.search(r'bud[sg](?:j?ett?|get)\s+(\d[\d\s]*)\s*kr', raw_prompt, re.IGNORECASE)
+    budget_match = re.search(r'(?:bud[sg](?:j?ett?|get)|orçamento|presupuesto)\s+(?:de\s+)?(\d[\d\s]*)\s*(?:kr|NOK)\b', raw_prompt, re.IGNORECASE)
     budget_amount = int(budget_match.group(1).replace(" ", "")) if budget_match else None
 
     # Employee hours: "Name (role, email) N hours/timar/timer/Stunden"
@@ -2294,9 +2312,9 @@ def _create_project(intent: dict, client: TripletexClient) -> None:
     # Supplier cost: "leverandørkostnad/supplier cost AMOUNT kr from/frå Supplier (org.nr XXXXX)"
     supplier_cost: dict | None = None
     supp_pattern = re.compile(
-        r'(?:leverandørkostnad|leverandorkostnad|supplier\s*cost|Lieferantenkosten|coste?\s*de\s*proveedor|custo\s*do\s*fornecedor)\s+'
-        r'(\d[\d\s]*)\s*kr\s*(?:frå|fra|from|von|de)\s+'
-        r'([A-ZÀ-Ž][\w\s]+?)(?:\s*\((?:org\.?\s*nr?\.?\s*)?(\d{9})\))?(?:\.|,|\s*$)',
+        r'(?:leverandørkostnad|leverandorkostnad|supplier\s*cost|Lieferantenkosten|coste?\s*de\s*proveedor|custo\s*d[eo]\s*fornecedor|coût\s*fournisseur)\s+'
+        r'(?:de\s+)?(\d[\d\s]*)\s*(?:kr|NOK)\s*(?:frå|fra|from|von|de)\s+'
+        r'([A-ZÀ-Ž][\w\s]+?)(?:\s*\((?:org\.?\s*n[rº]?\.?\s*)?(\d{9})\))?(?:\.|,|\s*$)',
         re.IGNORECASE | re.UNICODE
     )
     supp_m = supp_pattern.search(raw_prompt)
@@ -2504,15 +2522,18 @@ def _create_project(intent: dict, client: TripletexClient) -> None:
         # (POST /project/orderline is [BETA] and returns 403)
         try:
             cost_acct = _resolve_account(client, "4300")  # cost of goods
-            if cost_acct:
+            credit_acct = _resolve_account(client, "2400") or cost_acct  # supplier payable
+            if cost_acct and credit_acct:
                 _post_value_with_heal(client, "/ledger/voucher", {
                     "date": start_date,
                     "description": f"Leverandørkostnad / Supplier cost – {supp_name}",
                     "postings": [
                         {"account": {"id": cost_acct["id"]}, "amountGross": supplier_cost["amount"],
+                         "amountGrossCurrency": supplier_cost["amount"],
                          "project": {"id": project_id}},
-                        {"account": {"id": (supplier or {}).get("id") and _resolve_account(client, "2400") or cost_acct},
-                         "amountGross": -supplier_cost["amount"]},
+                        {"account": {"id": credit_acct["id"]},
+                         "amountGross": -supplier_cost["amount"],
+                         "amountGrossCurrency": -supplier_cost["amount"]},
                     ],
                 })
             logger.info(f"create_project: supplier cost {supplier_cost['amount']} for {supp_name}")
@@ -3444,7 +3465,6 @@ def _ledger_task(intent: dict, client: TripletexClient) -> None:
                         "account": {"id": acct["id"]},
                         "amountGross": amt,
                         "amountGrossCurrency": amt,
-                        "date": voucher_date,
                         "description": voucher_desc,
                     }
                     # Assign dimension value — use specific if provided, else default
@@ -3470,7 +3490,6 @@ def _ledger_task(intent: dict, client: TripletexClient) -> None:
                             "account": {"id": bal_acct["id"]},
                             "amountGross": -total,
                             "amountGrossCurrency": -total,
-                            "date": voucher_date,
                             "description": voucher_desc,
                         })
                     else:
@@ -4155,6 +4174,33 @@ def _book_receipt(intent: dict, client: TripletexClient) -> None:
     total_incl_vat = float(inv.get("amount") or 0)
     item_name = inv.get("description") or ""
     receipt_date = inv.get("date") or TODAY
+    parser_account_code = inv.get("account_code") or ""
+
+    # Fallback: extract item name from raw prompt when parser didn't provide it
+    if not item_name and _raw:
+        # Patterns: "the ITEM expense from this receipt", "ITEM fra denne kvitteringen",
+        # "el gasto de ITEM de este recibo", "die ITEM-Ausgabe aus dieser Quittung"
+        _item_m = _re.search(
+            r'(?:the\s+|el\s+gasto\s+de\s+|a\s+despesa\s+de\s+|die\s+|la\s+dépense\s+de\s+)?'
+            r'(\b[A-ZÆØÅÀ-Ž][A-ZÆØÅÀ-Ža-zæøåà-ž0-9 -]+?)\s+'
+            r'(?:expense|fra denne|de este recibo|de ce reçu|aus dieser|despesa|gasto|utgift)',
+            _raw, _re.IGNORECASE,
+        )
+        if _item_m:
+            item_name = _item_m.group(1).strip()
+        else:
+            # Simpler fallback: "Vi trenger ITEM fra denne kvitteringen"
+            _item_m2 = _re.search(
+                r'(?:trenger|need|necesitamos|precisamos|brauchen|besoin)\s+'
+                r'(?:the\s+|el\s+|a\s+|die\s+|la\s+)?'
+                r'(\b[A-ZÆØÅÀ-Ž][A-ZÆØÅÀ-Ža-zæøåà-ž0-9 -]+?)\s+'
+                r'(?:fra|from|de|aus|du)',
+                _raw, _re.IGNORECASE,
+            )
+            if _item_m2:
+                item_name = _item_m2.group(1).strip()
+        if item_name:
+            logger.info(f"book_receipt: extracted item name from prompt: '{item_name}'")
 
     # Extract department from prompt
     dept_name: str | None = None
@@ -4216,11 +4262,22 @@ def _book_receipt(intent: dict, client: TripletexClient) -> None:
     supports_vat = True
     item_low = (item_name or "").lower()
     raw_low = _raw.lower()
+    keyword_matched = False
     for keywords, acct_num, vat_ok in _EXPENSE_ACCOUNT_MAP:
         if any(kw in item_low or kw in raw_low for kw in keywords):
             expense_acct_num = acct_num
             supports_vat = vat_ok
+            keyword_matched = True
             break
+
+    # Use parser's account_code if keywords didn't match and parser provided one
+    if not keyword_matched and parser_account_code:
+        # Avoid 7100 (VAT-locked) — use 7140 instead for travel
+        if parser_account_code == "7100":
+            expense_acct_num = "7140"
+        else:
+            expense_acct_num = parser_account_code
+        logger.info(f"book_receipt: using parser account_code={expense_acct_num}")
 
     # ── Look up accounts ──────────────────────────────────────────────
     _ACCT_NAMES = {
