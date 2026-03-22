@@ -55,6 +55,12 @@ class TripletexClient:
         # Full call trace for episode logging
         self.call_log: list[dict] = []
 
+        # Session-level caches (avoids redundant GET calls)
+        self._account_cache: dict[str, dict | None] = {}    # number -> account dict
+        self._vat_type_cache: dict[str, dict | None] = {}    # number -> vatType dict
+        self._payment_type_id: int | None = None
+        self._payment_type_resolved: bool = False
+
         self._session = requests.Session()
         self._session.auth = ("0", session_token)
         self._session.headers.update(
@@ -188,3 +194,50 @@ class TripletexClient:
         if isinstance(data, dict) and "value" in data:
             return data["value"]
         return data
+
+    # ------------------------------------------------------------------ #
+    # Cached lookups (save API calls across workflows)
+    # ------------------------------------------------------------------ #
+
+    def get_account(self, number: str) -> dict | None:
+        """Get a ledger account by number, cached per session."""
+        if number in self._account_cache:
+            return self._account_cache[number]
+        try:
+            results = self.get_list("/ledger/account", params={"number": number, "count": 5})
+            acct = results[0] if results else None
+        except Exception:
+            acct = None
+        self._account_cache[number] = acct
+        return acct
+
+    def get_vat_type(self, number: str) -> dict | None:
+        """Get a VAT type by number, cached per session."""
+        if number in self._vat_type_cache:
+            return self._vat_type_cache[number]
+        try:
+            results = self.get_list("/ledger/vatType", params={"number": number, "count": 5, "fields": "id,name,number,percentage"})
+            vt = results[0] if results else None
+        except Exception:
+            vt = None
+        self._vat_type_cache[number] = vt
+        return vt
+
+    def get_payment_type(self) -> int | None:
+        """Get the default invoice payment type ID, cached per session."""
+        if self._payment_type_resolved:
+            return self._payment_type_id
+        self._payment_type_resolved = True
+        try:
+            types = self.get_list("/invoice/paymentType", params={"fields": "id,description", "count": 20})
+            if not types:
+                return None
+            _BANK_KW = ("bank", "overføring", "transfer", "konto", "giro")
+            preferred = next(
+                (t for t in types if any(kw in (t.get("description") or "").lower() for kw in _BANK_KW)),
+                types[0],
+            )
+            self._payment_type_id = preferred["id"]
+        except Exception:
+            pass
+        return self._payment_type_id

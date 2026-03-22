@@ -58,6 +58,10 @@ TASK TYPES
 create_employee
   Create a new employee. Extract:
   - first_name, last_name, email, phone
+  - employee_number: employee number/ansattnummer if explicitly mentioned
+  - address: street address if mentioned
+  - postal_code: zip / postnummer if mentioned
+  - city: city name if mentioned
   - start_date (YYYY-MM-DD): employment start date if mentioned
   - annual_salary: yearly salary in NOK if mentioned (e.g. "660 000 kr/år" → 660000, "kr 920 000" → 920000)
   - work_percent: percentage of full-time employment if mentioned (e.g. "80 %" → 80, "100%" → 100)
@@ -65,6 +69,10 @@ create_employee
   - occupation_code: numeric occupation code if explicitly given (e.g. "5223" from "stillingskode 5223")
   - date_of_birth (YYYY-MM-DD): birth date if mentioned
   - national_id_number: national ID / personnummer if mentioned
+  - department_name: department name if mentioned (e.g. "IT", "Salg", "Økonomi", "Marketing", "HR")
+  - hours_per_day: standard working hours per day if mentioned (typically 7.5 for full-time in Norway)
+  - bank_account_number: employee's bank account number if mentioned
+  - comments: any additional comments/notes about the employee
   - is_account_admin: TRUE if role is any of:
     nb: kontoadministrator, kontoadmin
     en: account administrator, account admin
@@ -74,9 +82,10 @@ create_employee
     de: Kontoadministrator, Kontoverwaltung
     fr: administrateur de compte
   IMPORTANT: For PDF employment contracts / arbeidsavtaler, extract ALL available
-  employment details — salary, work percentage, occupation, start date are
-  commonly included. Do NOT leave annual_salary/work_percent/job_title null
-  when the contract specifies them.
+  employment details — salary, work percentage, occupation, start date,
+  department name are commonly included. Do NOT leave annual_salary/work_percent/
+  job_title/department_name null when the contract specifies them.
+  If "configure standard work hours" is mentioned, set hours_per_day to 7.5 (Norwegian standard).
 
 update_employee
   Update existing employee fields. Use "identifier" for the name/email used to find them.
@@ -86,6 +95,23 @@ delete_employee
 
 create_customer
   Create customer/client. Extract: name, email, phone, org_number.
+  Also extract address fields when mentioned:
+  - address: street address (e.g. "Storgata 1", "Karl Johans gate 5")
+  - postal_code: zip / postnummer (e.g. "0154", "5003")
+  - city: city name (e.g. "Oslo", "Bergen")
+  - invoice_email: email for invoices if different from main email
+  - invoice_send_method: "EMAIL" if invoices should be sent by email
+  - website: company website URL if mentioned
+  - description: company description if mentioned
+  - phone_mobile: mobile phone number if separate from main phone
+  - language: "NO" or "EN" if specified
+  - is_private_individual: true if the customer is a private person (not a company)
+  - invoices_due_in: payment term in days if mentioned (e.g. 30)
+  - invoices_due_in_type: "DAYS" or "MONTHS" if payment terms mentioned
+  - delivery_address: delivery street address if different from main address
+  - delivery_postal_code: delivery postal code
+  - delivery_city: delivery city
+  - account_manager: name of the account manager if mentioned
   Set is_supplier=true if they are a supplier.
 
 update_customer
@@ -94,6 +120,18 @@ update_customer
 delete_customer
   Remove a customer.
 
+create_contact
+  Create a contact person linked to an existing customer or supplier.
+  Use when the prompt mentions: kontaktperson, contact person, Kontaktperson, personne de contact, persona de contacto.
+  Extract:
+  - first_name, last_name: contact person's name
+  - email: contact email
+  - phone: contact phone / mobile number
+  - customer_name: name of the customer to link to (if applicable)
+  - supplier_name: name of the supplier to link to (if applicable)
+  - org_number: org number of the customer/supplier (if mentioned)
+  Example entity: {{"contact": {{"first_name": "Per", "last_name": "Hansen", "email": "per@acme.no", "phone": "99887766", "customer_name": "Acme AS", "supplier_name": null, "org_number": null}}}}
+
 create_product
   Create a product or service. Extract: name, number, price_excl_vat, vat_rate (0/15/25), unit, description.
 
@@ -101,7 +139,7 @@ create_invoice
   Create an invoice. Steps: find/create customer → create order → create invoice.
   Extract under customer: name (identifier for lookup).
   Extract under invoice: date (YYYY-MM-DD, default today), due_days (default 14).
-  Extract order_lines: each line has description, count, unit_price_excl_vat.
+  Extract order_lines: each line has description, count, unit_price_excl_vat, vat_rate (integer: 25, 15, or 0), product_number (string, if mentioned in parentheses or explicitly).
   If a single amount is given with no line detail, make one line with that amount.
   ALSO MATCHES (multilingual): "commande" / "bon de commande" (fr), "Rechnung" / "Bestellung" (de), "factura" / "pedido" (es), "fatura" (pt), "bestilling" (nb/nn).
   NOTE: This is an OUTGOING invoice to a customer. For an INCOMING invoice from a supplier, use create_supplier_invoice instead.
@@ -118,15 +156,35 @@ create_supplier_invoice
   Extract under customer: name (= the supplier name), org_number, email, address, postal_code, city; set is_supplier=true.
   Extract under invoice: invoice_number (external ref e.g. "INV-2026-3063"), amount (total incl VAT),
     amount_excl_vat (if stated), date (YYYY-MM-DD), vat_rate (default 25), account_code (GL account, e.g. 7300).
+    For account_code: infer from the item/purchase if not explicitly given:
+      Office supplies/kontorutstyr: 6500. IT equipment: 6860. Consulting: 6700. Travel: 7100.
+      Furniture: 6540. Cleaning supplies: 6300. General materials: 4000.
+  Extract under notes: department name if mentioned (e.g. "avdeling Lager" → "Lager", "department Sales" → "Sales").
+
+book_receipt
+  Book a specific expense item FROM a receipt/kvittering to the correct account and department.
+  Use when the prompt says: "receipt", "kvittering", "quittung", "reçu", "recibo",
+    "expense from this receipt", "expense from this kvittering", "utgiften fra denne kvitteringen".
+  Extract under invoice: amount (total incl VAT for the SPECIFIC item), description (= the item name from receipt),
+    date (receipt date YYYY-MM-DD).
+  Extract under notes: department name if mentioned.
 
 register_payment
-  Register a payment against an existing invoice.
-  Extract under invoice: identifier (invoice number if numeric, else customer name).
+  Register a payment against an existing invoice, OR reverse/cancel an existing payment.
+  Extract under invoice: identifier (invoice number if numeric, else customer name),
+    description (invoice description/title if mentioned, e.g. "Netzwerkdienst", "Consulting").
   Extract under payment: amount (in NOK), date (default today),
     amount_currency (amount in the invoice's foreign currency, e.g. EUR amount),
     currency (ISO code: "EUR", "USD", etc. — only if foreign currency),
-    exchange_rate_difference (NOK difference between booked rate and payment rate, if stated).
-  Extract under customer: name (to find invoice by customer).
+    exchange_rate_difference (NOK difference between booked rate and payment rate, if stated),
+    is_reversal (boolean): set to TRUE if the prompt asks to REVERSE, CANCEL, or UNDO a payment:
+      nb: "reverser betaling", "tilbakefør", "stornere betaling"
+      en: "reverse payment", "cancel payment", "undo payment", "bounced"
+      de: "Stornieren", "zurückgebucht", "Rückbuchung", "Zahlung stornieren"
+      es: "revertir pago", "anular pago", "cancelar pago"
+      pt: "reverter pagamento", "cancelar pagamento", "estornar pagamento"
+      fr: "annuler le paiement", "contrepasser", "remboursement"
+  Extract under customer: name, org_number (to find invoice by customer).
 
 create_credit_note
   Create a credit note (reversal) for an invoice.
@@ -166,18 +224,26 @@ run_payroll
     year (current year if not stated), month (current month if not stated).
 
 create_project_invoice
-  Register hours worked on a project for an employee, then generate a project invoice.
-  Use when the prompt asks to BOTH register hours AND generate a project invoice:
+  Create a project and generate an invoice linked to it.
+  Use for TWO scenarios:
+  A) HOURS-BASED: register hours worked on a project, then invoice
     es: "Registre X horas...en la actividad...del proyecto...Genere una factura de proyecto"
     fr: "Enregistrez X heures...sur l'activité...du projet...Générez une facture de projet"
     en: "Register X hours...on activity...of project...generate a project invoice"
     nb: "Registrer X timer...på aktiviteten...for prosjektet...generer prosjektfaktura"
     de: "X Stunden erfassen...auf Aktivität...des Projekts...Projektrechnung erstellen"
     pt: "Registre X horas...na atividade...do projeto...gere uma fatura de projeto"
+  B) FIXED-PRICE: set a fixed price on a project, then invoice a portion
+    nb/nn: "Sett fastpris...på prosjektet...Fakturer kunden"
+    en: "Set fixed price...on project...Invoice the customer"
+    de: "Festpreis...für das Projekt...Rechnung erstellen"
+  ALSO use create_project_invoice when prompt mentions "prosjektleiar"/"prosjektleder"/"project leader" + project + invoice.
   Extract under employee: identifier (full name), email (if present), first_name, last_name.
-  Extract under project: name (project name), activity (activity name, e.g. "Design").
+  Extract under project: name (project name), activity (activity name if given, e.g. "Design").
   Extract under customer: name, org_number (if present).
-  Extract under invoice: hours (number of hours), hourly_rate (rate per hour in NOK), date (today if not given).
+  Extract under invoice: hours (number of hours, 0 if fixed-price), hourly_rate (rate per hour in NOK),
+    date (today if not given), amount (total invoice amount in NOK if calculable),
+    fixed_price (total project fixed price if stated), partial_percentage (percentage to invoice, e.g. 25).
 
 delete_travel_expense
   Delete a travel expense report.
@@ -187,7 +253,10 @@ delete_travel_expense
 create_project
   Create a project linked to a customer.
   Extract under project: name, number, start_date, end_date, description.
-  Extract under customer: name (to find/create customer).
+  Extract under customer: name, org_number (to find/create customer).
+  Extract under employee: identifier (project manager full name), email (if given).
+  The project manager ("prosjektleder", "director del proyecto", "Projektleiter",
+  "chef de projet", "gerente de projeto") should be extracted under "employee".
 
 create_department
   Create one or more departments.
@@ -206,11 +275,40 @@ delete_voucher
 
 ledger_task
   Post complex ledger entries: corrections, depreciation, monthly/annual close,
-  OR create custom (free) accounting dimensions with values and optional voucher.
+  create custom (free) accounting dimensions, OR analyze ledger and create projects.
   Use when the task involves reversing wrong vouchers, posting depreciation entries,
-  doing period-end accounting close, OR creating custom accounting dimensions.
+  doing period-end accounting close, creating custom accounting dimensions,
+  OR analyzing the general ledger (hovedbok) to find accounts and create projects/activities based on analysis.
   Extract under ledger:
-    - subtask: one of "correction", "depreciation", "monthly_close", "annual_close", "custom_dimension", "voucher"
+    - subtask: one of "correction", "depreciation", "monthly_close", "annual_close", "custom_dimension", "voucher", "analysis_create_projects"
+      Use "analysis_create_projects" when the prompt says to ANALYZE the ledger/general ledger (hovedbok)
+      to find specific accounts (e.g. "biggest increase", "highest cost") and then CREATE projects/activities for each.
+    - description: description of what is being posted
+    - date (YYYY-MM-DD): accounting date for the entry (default today)
+    - date_from, date_to: date range to search for vouchers to correct (for "correction")
+    - corrections: array of individual errors to fix (for "correction" subtask). Each object:
+        error_type: one of "wrong_account", "duplicate", "missing_vat", "wrong_amount"
+        wrong_account: the account number that was used incorrectly (string, e.g. "6540")
+        correct_account: the correct account number it should have been (string, e.g. "6860") — for "wrong_account"
+        amount: the amount (NOK) on the erroneous posting (number, positive)
+        correct_amount: the correct amount it should be (number) — for "wrong_amount"
+        vat_account: the VAT account (e.g. "2710") — for "missing_vat"
+        amount_excl_vat: the amount excluding VAT — for "missing_vat"
+      Examples:
+        wrong_account: {{"error_type": "wrong_account", "wrong_account": "6540", "correct_account": "6860", "amount": 4350}}
+        duplicate: {{"error_type": "duplicate", "wrong_account": "6590", "amount": 2500}}
+        missing_vat: {{"error_type": "missing_vat", "wrong_account": "6590", "amount_excl_vat": 8200, "vat_account": "2710"}}
+        wrong_amount: {{"error_type": "wrong_amount", "wrong_account": "6500", "amount": 16900, "correct_amount": 10300}}
+    - analysis: object for "analysis_create_projects" subtask:
+        period1_from: YYYY-MM-DD (e.g. "2026-01-01")
+        period1_to: YYYY-MM-DD (e.g. "2026-02-01", exclusive)
+        period2_from: YYYY-MM-DD (e.g. "2026-02-01")
+        period2_to: YYYY-MM-DD (e.g. "2026-03-01", exclusive)
+        criteria: "biggest_increase" or "highest_cost"
+        top_n: number of top accounts to pick (e.g. 3)
+        account_range_from: first account number to consider (e.g. 4000 for cost accounts)
+        account_range_to: last account number to consider (e.g. 7999 for cost accounts)
+        create_activity: true if an activity should also be created for each project
     - description: description of what is being posted
     - date (YYYY-MM-DD): accounting date for the entry (default today)
     - date_from, date_to: date range to search for vouchers to correct (for "correction")
@@ -532,8 +630,19 @@ def _parse_task_sync(prompt: str, files: list[FileAttachment]) -> dict[str, Any]
                 )
             )
         elif f.mime_type == "application/pdf":
+            # Send PDF as native binary part for Gemini's multimodal understanding
+            # (handles scanned docs, tables, formatting that text extraction misses)
+            try:
+                pdf_bytes = base64.b64decode(f.content_base64)
+                parts.append(
+                    types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf")
+                )
+            except Exception as exc:
+                logger.warning(f"PDF binary part failed for {f.filename}: {exc}")
+            # Also include extracted text as supplementary context
             pdf_text = _extract_pdf_text(f.content_base64, f.filename)
-            parts.append(types.Part.from_text(text=pdf_text))
+            if pdf_text and "could not extract" not in pdf_text:
+                parts.append(types.Part.from_text(text=pdf_text))
         elif f.mime_type in ("text/csv", "application/csv") or f.filename.endswith(".csv"):
             try:
                 csv_text = base64.b64decode(f.content_base64).decode("utf-8", errors="replace")

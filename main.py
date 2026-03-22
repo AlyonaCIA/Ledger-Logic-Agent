@@ -52,8 +52,9 @@ _EPISODE_FILE = _LOGS_DIR / "episodes.jsonl"
 # Optional API key to protect the /solve endpoint (set via env var API_KEY).
 _API_KEY: str | None = os.getenv("API_KEY")
 
-# Internal hard deadline: 240 s → leaves 60 s buffer before the 300 s competition timeout.
-_INTERNAL_TIMEOUT_S = 240
+# Internal hard deadline: 290 s → competition allows 300 s.
+# (Previous 110 s was for Cloudflare tunnel; ngrok has no such limit.)
+_INTERNAL_TIMEOUT_S = 290
 
 
 @asynccontextmanager

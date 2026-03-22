@@ -229,7 +229,7 @@ def resolve_invoice(
         "invoiceDateFrom": date_from,
         "invoiceDateTo": date_to,
         "count": 100,
-        "fields": "id,invoiceNumber,amountOutstanding,amountCurrency,customer",
+        "fields": "id,invoiceNumber,amount,amountOutstanding,amountCurrency,customer",
     }
     if customer_id:
         params["customerId"] = customer_id
